@@ -23,7 +23,7 @@ Det-SAM2项目是一个基于Segment Anything Model 2 分割模型（[SAM2](http
 
 除此之外可能有一些额外的包需要独立独立安装，请根据报错提示安装他们（都是一些常见的包，不会很多）
 
-或者您可以直接进入AutoDL中我们已经发布的镜像https://www.codewithgpu.com/i/motern88/Det-SAM2/Det-SAM2，这样您将可以直接上手几乎无需任何环境配置。
+或者您可以直接进入AutoDL中我们已经发布的镜像，这样您将可以直接上手几乎无需任何环境配置：https://www.codewithgpu.com/i/motern88/Det-SAM2/Det-SAM2，这样您将可以直接上手几乎无需任何环境配置。
 
 我们项目的大部分可执行文件位于segment-anything-2根目录下的det_sam2_inference文件夹：
 
