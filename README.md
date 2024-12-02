@@ -25,7 +25,7 @@ Our project is built based on version 2.1 of SAM2. The environment dependencies 
 
 In addition, there may be a few extra packages that need to be installed separately. Please refer to the error messages and install them as required (these are common packages and shouldn't be many).
 
-Alternatively, you can directly access the image we have published on AutoDL at https://www.codewithgpu.com/i/motern88/Det-SAM2/Det-SAM2
+Alternatively, **you can directly access the image we have published on AutoDL** at https://www.codewithgpu.com/i/motern88/Det-SAM2/Det-SAM2
 
 Most of the executable files in our project are located in the `det_sam2_inference` folder under the root directory of `segment-anything-2`.
 
