@@ -1,5 +1,7 @@
 ### Det-SAM2-pipeline
 
+我们的技术报告于https://arxiv.org/abs/2411.18977
+
 Det-SAM2项目是一个基于Segment Anything Model 2 分割模型（[SAM2](https://github.com/facebookresearch/sam2)），利用YOLOv8检测模型自动为SAM2添加提示，再使用后处理部分对SAM2分割结果进行专有场景业务判断（本项目实现于台球场景）的，无需人工干预自动视频物体追踪pipeline。
 
 对于SAM2适配预测器，我们的核心贡献有：
