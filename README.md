@@ -1,5 +1,7 @@
 ### Det-SAM2-pipeline
 
+Our tech report in https://arxiv.org/abs/2411.18977
+
 The Det-SAM2 project is a pipeline based on the Segment Anything Model 2 segmentation model ([SAM2](https://github.com/facebookresearch/sam2)) that uses the YOLOv8 detection model to automatically generate prompts for SAM2. It further processes SAM2's segmentation results through scenario-specific business logic, achieving fully automated object tracking in videos without human intervention. This implementation is tailored for billiard table scenarios.
 
 For the SAM2-compatible predictor, our core contributions include:
