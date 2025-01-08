@@ -115,12 +115,18 @@ def build_sam2_video_predictor(
     mode="eval",
     hydra_overrides_extra=[],
     apply_postprocessing=True,
+    vos_optimized=False,
     **kwargs,
 ):
     # 设置 Hydra 覆盖选项，初始化 SAM2 视频预测器
     hydra_overrides = [
         "++model._target_=sam2.sam2_video_predictor.SAM2VideoPredictor",
     ]
+    if vos_optimized:  # 如果启用了 VOS（视频目标分割）优化
+        hydra_overrides = [
+            "++model._target_=sam2.sam2_video_predictor.SAM2VideoPredictorVOS",  # 设置模型的目标（target），指定为 sam2 的 SAM2VideoPredictorVOS 类
+            "++model.compile_image_encoder=True",  # 启用编译图像编码器，允许 sam2_base 处理这个过程 Let sam2_base handle this
+        ]
     if apply_postprocessing:
         hydra_overrides_extra = hydra_overrides_extra.copy()
         hydra_overrides_extra += [

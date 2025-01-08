@@ -33,9 +33,7 @@ def window_partition(x, window_size):
 
     # 将输入张量视为多个小窗口并重新排列
     x = x.view(B, Hp // window_size, window_size, Wp // window_size, window_size, C)
-    windows = (
-        x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, window_size, window_size, C)
-    )
+    windows = x.permute(0, 1, 3, 2, 4, 5).reshape(-1, window_size, window_size, C)
     return windows, (Hp, Wp)  # 返回窗口化后的张量和填充后的尺寸
 
 
@@ -53,13 +51,13 @@ def window_unpartition(windows, window_size, pad_hw, hw):
     Hp, Wp = pad_hw  # 获取填充后的高度和宽度
     H, W = hw  # 获取填充前的原始高度和宽度
     B = windows.shape[0] // (Hp * Wp // window_size // window_size)  # 计算批次大小
-    x = windows.view(
+    x = windows.reshape(
         B, Hp // window_size, Wp // window_size, window_size, window_size, -1
     )  # 将窗口张量视为原始形状
-    x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, Hp, Wp, -1)  # 重新排列
+    x = x.permute(0, 1, 3, 2, 4, 5).reshape(B, Hp, Wp, -1)  # 重新排列
 
     if Hp > H or Wp > W:  # 如果高度或宽度超过原始大小
-        x = x[:, :H, :W, :].contiguous()  # 移除填充部分
+        x = x[:, :H, :W, :]  # 移除填充部分
     return x  # 返回恢复后的张量
 
 

@@ -80,7 +80,7 @@ class VideoProcessor:
         )
 
         # 构建SAM2模型
-        self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint)
+        self.predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, vos_optimized=False)   # vos_optimized=True开启编译
         # 加载YOLOv8n模型
         self.detect_model = YOLO(detect_model_weights)
 
@@ -361,20 +361,6 @@ class VideoProcessor:
                 inference_state=self.inference_state
             )
 
-        # print("当前 inference_state 的特定键值：")
-        # print(f"obj_id_to_idx: {self.inference_state['obj_id_to_idx']}")  # OrderedDict([(16, 0), (10, 1)])
-        # print(f"obj_idx_to_id: {self.inference_state['obj_idx_to_id']}")  # OrderedDict([(0, 16), (1, 10)])
-        # print(f"obj_ids: {self.inference_state['obj_ids']}")  # [16, 10]
-        # print(f"point_inputs_per_obj: {self.inference_state['point_inputs_per_obj']}")  # {第0索引物体: {第N索引帧：提示信息的种类和坐标, 第M索引帧：提示信息的种类和坐标},第1索引物体: {第K索引帧：提示信息的种类和坐标}}
-        # # {0: {90: {'point_coords': tensor([[[544.9968, 531.2661],[564.3727, 565.0934]]], device='cuda:0'),'point_labels': tensor([[2, 3]], device='cuda:0', dtype=torch.int32)},
-        # #      105: {'point_coords': tensor([[[535.3818, 440.6492],[554.4316, 474.4221]]], device='cuda:0'),'point_labels': tensor([[2, 3]], device='cuda:0', dtype=torch.int32)}},
-        # #  1: {105: {'point_coords': tensor([[[533.5795, 200.6569],[552.9704, 247.3801]]], device='cuda:0'),'point_labels': tensor([[2, 3]], device='cuda:0', dtype=torch.int32)}}
-        # print(f"mask_inputs_per_obj: {self.inference_state['mask_inputs_per_obj']}")  # {0: {}, 1: {}}
-        # print(f"output_dict_per_obj: {self.inference_state['output_dict_per_obj'].keys()}")  # dict_keys([0, 1])
-        # print(f"temp_output_dict_per_obj: {self.inference_state['temp_output_dict_per_obj']}")
-        # # {0: {'cond_frame_outputs': {}, 'non_cond_frame_outputs': {}},
-        # #  1: {'cond_frame_outputs': {}, 'non_cond_frame_outputs': {}}}
-
         # SAM2推理
         try:
             self.inference_state = self.Detect_2_SAM2_Prompt(detection_results_json)
@@ -610,6 +596,10 @@ class VideoProcessor:
         # 支持后处理操作，将结果保存成pkl以供后处理读取
         # 保存self.video_segments分割结果的字典,保存的self.video_segments不应当带有预加载帧
         self.video_segments = {idx - self.pre_frames: segment for idx, segment in self.video_segments.items() if idx >= self.pre_frames}
+        # 如果路径不存在则创建
+        directory = os.path.dirname(output_video_segments_pkl_path)
+        if not os.path.exists(directory):
+            os.makedirs(directory, exist_ok=True)
         with open(output_video_segments_pkl_path, 'wb') as file:
             pickle.dump(self.video_segments, file)
         print(f"---self.video_segments分割结果保存至{output_video_segments_pkl_path}")
@@ -655,7 +645,7 @@ class VideoProcessor:
 
 if __name__ == '__main__':
     # video_path = 'videos/video中.mp4'
-    video_path = '/root/autodl-tmp/data/Det-SAM2评估集/videos/video149.mp4' # /Det-SAM2评估集/videos/video5.mp4  # /长视频/5min.mp4
+    video_path = '/root/autodl-tmp/data/Det-SAM2-Evaluation/videos/video117.mp4' # /Det-SAM2评估集/videos/video5.mp4  # /长视频/5min.mp4
     rtsp_url = 'rtsp://175.178.18.243:19699/'
     frame_dir = '/root/autodl-tmp/data/预加载内存库10帧'  # 制作预加载内存库用
     output_dir = './temp_output/det_sam2_RT_output'
@@ -679,6 +669,6 @@ if __name__ == '__main__':
     # processor.print_gpu_memory()
 
     processor.run(
-        video_path=rtsp_url,  # 传入视频路径（和帧文件夹二选一）
+        video_path=video_path,  # 传入视频路径（和帧文件夹二选一）
         # frame_dir=frame_dir,  # 传入帧文件夹（和视频路径二选一）
     )

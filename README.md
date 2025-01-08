@@ -1,245 +1,224 @@
-### Det-SAM2-pipeline
+# SAM 2: Segment Anything in Images and Videos
 
-Our tech report in https://arxiv.org/abs/2411.18977
+**[AI at Meta, FAIR](https://ai.meta.com/research/)**
 
-The Det-SAM2 project is a pipeline based on the Segment Anything Model 2 segmentation model ([SAM2](https://github.com/facebookresearch/sam2)) that uses the YOLOv8 detection model to automatically generate prompts for SAM2. It further processes SAM2's segmentation results through scenario-specific business logic, achieving fully automated object tracking in videos without human intervention. This implementation is tailored for billiard table scenarios.
+[Nikhila Ravi](https://nikhilaravi.com/), [Valentin Gabeur](https://gabeur.github.io/), [Yuan-Ting Hu](https://scholar.google.com/citations?user=E8DVVYQAAAAJ&hl=en), [Ronghang Hu](https://ronghanghu.com/), [Chaitanya Ryali](https://scholar.google.com/citations?user=4LWx24UAAAAJ&hl=en), [Tengyu Ma](https://scholar.google.com/citations?user=VeTSl0wAAAAJ&hl=en), [Haitham Khedr](https://hkhedr.com/), [Roman Rädle](https://scholar.google.de/citations?user=Tpt57v0AAAAJ&hl=en), [Chloe Rolland](https://scholar.google.com/citations?hl=fr&user=n-SnMhoAAAAJ), [Laura Gustafson](https://scholar.google.com/citations?user=c8IpF9gAAAAJ&hl=en), [Eric Mintun](https://ericmintun.github.io/), [Junting Pan](https://junting.github.io/), [Kalyan Vasudev Alwala](https://scholar.google.co.in/citations?user=m34oaWEAAAAJ&hl=en), [Nicolas Carion](https://www.nicolascarion.com/), [Chao-Yuan Wu](https://chaoyuan.org/), [Ross Girshick](https://www.rossgirshick.info/), [Piotr Dollár](https://pdollar.github.io/), [Christoph Feichtenhofer](https://feichtenhofer.github.io/)
 
-For the SAM2-compatible predictor, our core contributions include:
+[[`Paper`](https://ai.meta.com/research/publications/sam-2-segment-anything-in-images-and-videos/)] [[`Project`](https://ai.meta.com/sam2)] [[`Demo`](https://sam2.metademolab.com/)] [[`Dataset`](https://ai.meta.com/datasets/segment-anything-video)] [[`Blog`](https://ai.meta.com/blog/segment-anything-2)] [[`BibTeX`](#citing-sam-2)]
 
-- Development of a **self-prompted video instance segmentation pipeline** (Det-SAM2-pipeline) that requires no manual interaction. It supports inference and segmentation of specific categories (determined by a custom detection model) from **video streams** and returns segmentation results with SAM2's original precision to enable further business-level processing.
-- We implemented functionality to **add new categories during inference and tracking** without interrupting the inference process.
-- Our pipeline allows applying the memory bank from one video inference session to new videos. We call this a **preload memory bank**, enabling the pipeline to leverage the inferred memory (object categories, shapes, and motion states) from a previous video for inference on new videos **without requiring additional prompts for the new video**.
-- We achieved **constant GPU and memory usage** in the Det-SAM2-pipeline, enabling inference for videos of unlimited length.
+![SAM 2 architecture](assets/model_diagram.png?raw=true)
 
-If you are optimizing SAM2 in an engineering context, we highly encourage you to refer to the implementation of Det-SAM2. Additionally, we built a complete pipeline using Det-SAM2 that handles business scenarios (billiard table) such as shot recognition, ball collision, and boundary rebound detection. Previously, traditional non-SAM2 tracking algorithms struggled to accurately address these three conditions in fast-moving billiard table scenarios.
+**Segment Anything Model 2 (SAM 2)** is a foundation model towards solving promptable visual segmentation in images and videos. We extend SAM to video by considering images as a video with a single frame. The model design is a simple transformer architecture with streaming memory for real-time video processing. We build a model-in-the-loop data engine, which improves model and data via user interaction, to collect [**our SA-V dataset**](https://ai.meta.com/datasets/segment-anything-video), the largest video segmentation dataset to date. SAM 2 trained on our data provides strong performance across a wide range of tasks and visual domains.
 
-**Note:** Our open-source scripts are annotated entirely in **Chinese** to facilitate development, without affecting functionality. If needed, you can use tools like ChatGPT to translate the annotations into your preferred language when referencing the script's functionality.
+![SA-V dataset](assets/sa_v_dataset.jpg?raw=true)
 
+## Latest updates
 
+**12/11/2024 -- full model compilation for a major VOS speedup and a new `SAM2VideoPredictor` to better handle multi-object tracking**
 
-### Installation
+- We now support `torch.compile` of the entire SAM 2 model on videos, which can be turned on by setting `vos_optimized=True` in `build_sam2_video_predictor`, leading to a major speedup for VOS inference.
+- We update the implementation of `SAM2VideoPredictor` to support independent per-object inference, allowing us to relax the assumption of prompting for multi-object tracking and adding new objects after tracking starts.
+- See [`RELEASE_NOTES.md`](RELEASE_NOTES.md) for full details.
 
-------
+**09/30/2024 -- SAM 2.1 Developer Suite (new checkpoints, training code, web demo) is released**
 
-Our project is built based on version 2.1 of SAM2. The environment dependencies are almost identical, so you can deploy it by following the installation instructions for SAM2.1: https://github.com/facebookresearch/sam2?tab=readme-ov-file#installation.
+- A new suite of improved model checkpoints (denoted as **SAM 2.1**) are released. See [Model Description](#model-description) for details.
+  * To use the new SAM 2.1 checkpoints, you need the latest model code from this repo. If you have installed an earlier version of this repo, please first uninstall the previous version via `pip uninstall SAM-2`, pull the latest code from this repo (with `git pull`), and then reinstall the repo following [Installation](#installation) below.
+- The training (and fine-tuning) code has been released. See [`training/README.md`](training/README.md) on how to get started.
+- The frontend + backend code for the SAM 2 web demo has been released. See [`demo/README.md`](demo/README.md) for details.
 
-In addition, there may be a few extra packages that need to be installed separately. Please refer to the error messages and install them as required (these are common packages and shouldn't be many).
+## Installation
 
-Alternatively, **you can directly access the image we have published on AutoDL** at https://www.codewithgpu.com/i/motern88/Det-SAM2/Det-SAM2
+SAM 2 needs to be installed first before use. The code requires `python>=3.10`, as well as `torch>=2.5.1` and `torchvision>=0.20.1`. Please follow the instructions [here](https://pytorch.org/get-started/locally/) to install both PyTorch and TorchVision dependencies. You can install SAM 2 on a GPU machine using:
 
-Most of the executable files in our project are located in the `det_sam2_inference` folder under the root directory of `segment-anything-2`.
+```bash
+git clone https://github.com/facebookresearch/sam2.git && cd sam2
 
-```python
-segment-anything-2/det_sam2_inference:
-├──data
-│   ├──Det-SAM2-Evaluation
-│   │   ├──videos
-│   │   ├──postprocess.jsonl  # annotation
-│   ├──preload_memory_10frames  # read frames to build preload memory bank
+pip install -e .
+```
+If you are installing on Windows, it's strongly recommended to use [Windows Subsystem for Linux (WSL)](https://learn.microsoft.com/en-us/windows/wsl/install) with Ubuntu.
 
-├──det_weights
-│   ├──train_referee12_960.pt  # yolov8n, our example weight in billiards scenario
+To use the SAM 2 predictor and run the example notebooks, `jupyter` and `matplotlib` are required and can be installed by:
 
-├──eval_output/eval_result
-│   ├──eval_results.json
-│   ├──result_visualize.py  # visualize eval_results.json(eval_det-sam2.py output)
-
-├──output_inference_state
-│   ├──inference_state.pkl  # generated preload memory bank
-
-├──pipeline_output
-├──temp_output
-│   ├──det_sam2_RT_output  # det_sam2_RT.py visualize output
-│   ├──prompt_results  # SAM2 prompt (by detect model) visualize output 
-│   ├──video_frames
-
-Det_SAM2_pipeline.py  # Det-SAM2 + post-process pipeline
-det_sam2_RT.py  # Det-SAM2 process function
-eval_det-sam2.py  # find optimal parameter combination
-frames2video.py
-postprocess_det_sam2.py  # post-processing example (billiards scenario)
+```bash
+pip install -e ".[notebooks]"
 ```
 
-Additionally, Det-SAM2 introduces the following modifications compared to SAM2 (our changes only add new features without removing any of the official functionalities implemented in SAM2.1):
+Note:
+1. It's recommended to create a new Python environment via [Anaconda](https://www.anaconda.com/) for this installation and install PyTorch 2.5.1 (or higher) via `pip` following https://pytorch.org/. If you have a PyTorch version lower than 2.5.1 in your current environment, the installation command above will try to upgrade it to the latest PyTorch version using `pip`.
+2. The step above requires compiling a custom CUDA kernel with the `nvcc` compiler. If it isn't already available on your machine, please install the [CUDA toolkits](https://developer.nvidia.com/cuda-toolkit-archive) with a version that matches your PyTorch CUDA version.
+3. If you see a message like `Failed to build the SAM 2 CUDA extension` during installation, you can ignore it and still use SAM 2 (some post-processing functionality may be limited, but it doesn't affect the results in most cases).
 
-```python
-segment-anything-2/sam2:
-├──modeling
-│   ├──sam2_base.py
-├──utils
-│   ├──misc.py
-sam2_video_predictor.py
+Please see [`INSTALL.md`](./INSTALL.md) for FAQs on potential issues and solutions.
+
+## Getting Started
+
+### Download Checkpoints
+
+First, we need to download a model checkpoint. All the model checkpoints can be downloaded by running:
+
+```bash
+cd checkpoints && \
+./download_ckpts.sh && \
+cd ..
 ```
 
-#### Checkpoints
-
-We use the SAM2.1 weights:
+or individually from:
 
 - [sam2.1_hiera_tiny.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt)
 - [sam2.1_hiera_small.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt)
 - [sam2.1_hiera_base_plus.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt)
 - [sam2.1_hiera_large.pt](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt)
 
-For the detection model, you can use any YOLOv8 weights of your choice or start with our billiard detection model trained specifically for billiard scenarios:
+(note that these are the improved checkpoints denoted as SAM 2.1; see [Model Description](#model-description) for details.)
 
-- [Det-SAM2-YOLO8-Weight](https://huggingface.co/ATA-space/Det-SAM2/tree/main/det_weights)
+Then SAM 2 can be used in a few lines as follows for image and video prediction.
 
+### Image prediction
 
+SAM 2 has all the capabilities of [SAM](https://github.com/facebookresearch/segment-anything) on static images, and we provide image prediction APIs that closely resemble SAM for image use cases. The `SAM2ImagePredictor` class has an easy interface for image prompting.
 
-### Getting Started
+```python
+import torch
+from sam2.build_sam import build_sam2
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-------
+checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
+model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+predictor = SAM2ImagePredictor(build_sam2(model_cfg, checkpoint))
 
-The scripts below demonstrate post-processing judgment in a billiard scenario by default. If you only need to use the Det-SAM2 framework, simply run `det_sam2_RT`.
-
-
-
-**1**.Execute Det-SAM2 segmentation mask prediction and post-processing scripts separately:
-
-Use the detection model to automatically provide prompts for SAM2, which then performs segmentation predictions on the video:
-
-```cmd
-python det_sam2_inference/det_sam2_RT.py
+with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    predictor.set_image(<your_image>)
+    masks, _, _ = predictor.predict(<input_prompts>)
 ```
 
-The `det_sam2_RT.py` script defines the `VideoProcessor` class (**parameter settings are explained below**), with its primary method being `VideoProcessor.run()`.
+Please refer to the examples in [image_predictor_example.ipynb](./notebooks/image_predictor_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/image_predictor_example.ipynb)) for static image use cases.
 
-After running `det_sam2_RT.py` and saving the segmentation result dictionary `self.video_segments`, use the post-processing script for business logic analysis on the segmented masks:
+SAM 2 also supports automatic mask generation on images just like SAM. Please see [automatic_mask_generator_example.ipynb](./notebooks/automatic_mask_generator_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/automatic_mask_generator_example.ipynb)) for automatic mask generation in images.
 
-```cmd
-python det_sam2_inference/postprocess_det_sam2.py
+### Video prediction
+
+For promptable segmentation and tracking in videos, we provide a video predictor with APIs for example to add prompts and propagate masklets throughout a video. SAM 2 supports video inference on multiple objects and uses an inference state to keep track of the interactions in each video.
+
+```python
+import torch
+from sam2.build_sam import build_sam2_video_predictor
+
+checkpoint = "./checkpoints/sam2.1_hiera_large.pt"
+model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+predictor = build_sam2_video_predictor(model_cfg, checkpoint)
+
+with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    state = predictor.init_state(<your_video>)
+
+    # add new prompts and instantly get the output on the same frame
+    frame_idx, object_ids, masks = predictor.add_new_points_or_box(state, <your_prompts>):
+
+    # propagate the prompts to get masklets throughout the video
+    for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
+        ...
 ```
 
-The `postprocess_det_sam2.py` script defines the `VideoPostProcessor` class (**parameter settings are explained below**), with its primary method being `VideoPostProcessor.run()`.
+Please refer to the examples in [video_predictor_example.ipynb](./notebooks/video_predictor_example.ipynb) (also in Colab [here](https://colab.research.google.com/github/facebookresearch/sam2/blob/main/notebooks/video_predictor_example.ipynb)) for details on how to add click or box prompts, make refinements, and track multiple objects in videos.
 
+## Load from 🤗 Hugging Face
 
+Alternatively, models can also be loaded from [Hugging Face](https://huggingface.co/models?search=facebook/sam2) (requires `pip install huggingface_hub`).
 
-**2**.Run the end-to-end pipeline script (supports constant GPU and memory usage), enabling asynchronous parallel inference of segmentation masks and post-processing judgments.
+For image prediction:
 
-Execute the full pipeline script to infer long videos in one go:
+```python
+import torch
+from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-```cmd
-python det_sam2_inference/Det_SAM2_pipeline.py
+predictor = SAM2ImagePredictor.from_pretrained("facebook/sam2-hiera-large")
+
+with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    predictor.set_image(<your_image>)
+    masks, _, _ = predictor.predict(<input_prompts>)
 ```
 
-The `Det_SAM2_pipeline.py` script defines the `DetSAM2Pipeline` class (**parameter settings explained below**). This class processes real-time video stream inference asynchronously and in parallel, combining the segmentation backbone (`VideoProcessor`) and post-processing (`VideoPostProcessor`) functionalities. Its primary method is `DetSAM2Pipeline.inference()`.
+For video prediction:
 
+```python
+import torch
+from sam2.sam2_video_predictor import SAM2VideoPredictor
 
+predictor = SAM2VideoPredictor.from_pretrained("facebook/sam2-hiera-large")
 
-**3**.Run the automated evaluation script to explore various parameter combinations:
+with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
+    state = predictor.init_state(<your_video>)
 
-```cmd
-python det_sam2_inference/eval_det-sam2.py
+    # add new prompts and instantly get the output on the same frame
+    frame_idx, object_ids, masks = predictor.add_new_points_or_box(state, <your_prompts>):
+
+    # propagate the prompts to get masklets throughout the video
+    for frame_idx, object_ids, masks in predictor.propagate_in_video(state):
+        ...
 ```
 
-The `eval_det-sam2.py` script defines the `EvalDetSAM2PostProcess` class (**parameter settings explained below**). This class loops through multiple candidate parameter combinations to infer the entire evaluation dataset. For each sample inference, the segmentation backbone (`VideoProcessor.run()`) and post-processing (`VideoPostProcessor.run()`) are executed sequentially. The evaluation results are collected and written to `eval_results.json`. The primary method for this script is `EvalDetSAM2PostProcess.eval_all_settings()`.
+## Model Description
 
-After completing the `eval_results.json` file, you can visualize the evaluation results for different parameter settings:
+### SAM 2.1 checkpoints
 
-```cmd
-python det_sam2_inference/eval_output/eval_result/result_visualize.py
+The table below shows the improved SAM 2.1 checkpoints released on September 29, 2024.
+|      **Model**       | **Size (M)** |    **Speed (FPS)**     | **SA-V test (J&F)** | **MOSE val (J&F)** | **LVOS v2 (J&F)** |
+| :------------------: | :----------: | :--------------------: | :-----------------: | :----------------: | :---------------: |
+|   sam2.1_hiera_tiny <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_t.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_tiny.pt))    |     38.9     |          91.2          |        76.5         |        71.8        |       77.3        |
+|   sam2.1_hiera_small <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_s.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt))   |      46      |          84.8          |        76.6         |        73.5        |       78.3        |
+| sam2.1_hiera_base_plus <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_b+.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_base_plus.pt)) |     80.8     |        64.1          |        78.2         |        73.7        |       78.2        |
+|   sam2.1_hiera_large <br /> ([config](sam2/configs/sam2.1/sam2.1_hiera_l.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_large.pt))   |    224.4     |          39.5          |        79.5         |        74.6        |       80.6        |
+
+### SAM 2 checkpoints
+
+The previous SAM 2 checkpoints released on July 29, 2024 can be found as follows:
+
+|      **Model**       | **Size (M)** |    **Speed (FPS)**     | **SA-V test (J&F)** | **MOSE val (J&F)** | **LVOS v2 (J&F)** |
+| :------------------: | :----------: | :--------------------: | :-----------------: | :----------------: | :---------------: |
+|   sam2_hiera_tiny <br /> ([config](sam2/configs/sam2/sam2_hiera_t.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_tiny.pt))   |     38.9     |          91.5          |        75.0         |        70.9        |       75.3        |
+|   sam2_hiera_small <br /> ([config](sam2/configs/sam2/sam2_hiera_s.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_small.pt))   |      46      |          85.6          |        74.9         |        71.5        |       76.4        |
+| sam2_hiera_base_plus <br /> ([config](sam2/configs/sam2/sam2_hiera_b+.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_base_plus.pt)) |     80.8     |     64.8    |        74.7         |        72.8        |       75.8        |
+|   sam2_hiera_large <br /> ([config](sam2/configs/sam2/sam2_hiera_l.yaml), [checkpoint](https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt))   |    224.4     | 39.7 |        76.0         |        74.6        |       79.8        |
+
+Speed measured on an A100 with `torch 2.5.1, cuda 12.4`. See `benchmark.py` for an example on benchmarking (compiling all the model components). Compiling only the image encoder can be more flexible and also provide (a smaller) speed-up (set `compile_image_encoder: True` in the config).
+## Segment Anything Video Dataset
+
+See [sav_dataset/README.md](sav_dataset/README.md) for details.
+
+## Training SAM 2
+
+You can train or fine-tune SAM 2 on custom datasets of images, videos, or both. Please check the training [README](training/README.md) on how to get started.
+
+## Web demo for SAM 2
+
+We have released the frontend + backend code for the SAM 2 web demo (a locally deployable version similar to https://sam2.metademolab.com/demo). Please see the web demo [README](demo/README.md) for details.
+
+## License
+
+The SAM 2 model checkpoints, SAM 2 demo code (front-end and back-end), and SAM 2 training code are licensed under [Apache 2.0](./LICENSE), however the [Inter Font](https://github.com/rsms/inter?tab=OFL-1.1-1-ov-file) and [Noto Color Emoji](https://github.com/googlefonts/noto-emoji) used in the SAM 2 demo code are made available under the [SIL Open Font License, version 1.1](https://openfontlicense.org/open-font-license-official-text/).
+
+## Contributing
+
+See [contributing](CONTRIBUTING.md) and the [code of conduct](CODE_OF_CONDUCT.md).
+
+## Contributors
+
+The SAM 2 project was made possible with the help of many contributors (alphabetical):
+
+Karen Bergan, Daniel Bolya, Alex Bosenberg, Kai Brown, Vispi Cassod, Christopher Chedeau, Ida Cheng, Luc Dahlin, Shoubhik Debnath, Rene Martinez Doehner, Grant Gardner, Sahir Gomez, Rishi Godugu, Baishan Guo, Caleb Ho, Andrew Huang, Somya Jain, Bob Kamma, Amanda Kallet, Jake Kinney, Alexander Kirillov, Shiva Koduvayur, Devansh Kukreja, Robert Kuo, Aohan Lin, Parth Malani, Jitendra Malik, Mallika Malhotra, Miguel Martin, Alexander Miller, Sasha Mitts, William Ngan, George Orlin, Joelle Pineau, Kate Saenko, Rodrick Shepard, Azita Shokrpour, David Soofian, Jonathan Torres, Jenny Truong, Sagar Vaze, Meng Wang, Claudette Ward, Pengchuan Zhang.
+
+Third-party code: we use a GPU-based connected component algorithm adapted from [`cc_torch`](https://github.com/zsef123/Connected_components_PyTorch) (with its license in [`LICENSE_cctorch`](./LICENSE_cctorch)) as an optional post-processing step for the mask predictions.
+
+## Citing SAM 2
+
+If you use SAM 2 or the SA-V dataset in your research, please use the following BibTeX entry.
+
+```bibtex
+@article{ravi2024sam2,
+  title={SAM 2: Segment Anything in Images and Videos},
+  author={Ravi, Nikhila and Gabeur, Valentin and Hu, Yuan-Ting and Hu, Ronghang and Ryali, Chaitanya and Ma, Tengyu and Khedr, Haitham and R{\"a}dle, Roman and Rolland, Chloe and Gustafson, Laura and Mintun, Eric and Pan, Junting and Alwala, Kalyan Vasudev and Carion, Nicolas and Wu, Chao-Yuan and Girshick, Ross and Doll{\'a}r, Piotr and Feichtenhofer, Christoph},
+  journal={arXiv preprint arXiv:2408.00714},
+  url={https://arxiv.org/abs/2408.00714},
+  year={2024}
+}
 ```
-
-
-
-#### Parameter Parsing
-
-------
-
-Below is an explanation of the parameters for the key classes and their main functions in the scripts `det_sam2_RT.py`, `postprocess_det_sam2.py`, `Det_SAM2_pipeline.py`, and `eval_det-sam2.py`.
-
-- **Parameters for initializing the `VideoProcessor` class** in `det_sam2_RT.py`:
-  - **`output_dir`**: Path to save rendered results. Default: `"./temp_output/det_sam2_RT_output"`.
-  - **`sam2_checkpoint`**: Path to the SAM2.1 model checkpoint, e.g., `"../checkpoints/sam2.1_hiera_large.pt"`.
-  - **`detect_model_weights`**: Weights of your YOLOv8 detection model trained for specific classes. In the billiards scenario example, use `"../checkpoints/sam2.1_hiera_large.pt"`.
-  - **`detect_confidence`**: Confidence threshold for the YOLO detection model. In the example, this is `0.85`.
-  - **`skip_classes`**: IDs of YOLO detection model classes you wish to ignore as prompts for SAM2. For instance, if you want to skip classes 11, 14, 15, and 19, set `skip_classes={11, 14, 15, 19}`.
-  - **`vis_frame_stride`**: Interval for rendering SAM2 segmentation results. Set to `-1` to disable rendering. Default: `-1`.
-  - **`visualize_prompt`**: Whether to visualize interaction/condition frames (frames with detection prompts). Useful for verifying if detection prompts are correct. Default: `False`.
-  - **`frame_buffer_size`**: Determines the number of video frames accumulated before SAM2 inference. For efficiency, inference is not performed for every frame. By default, the buffer processes 30 frames at a time, i.e., `frame_buffer_size=30`.
-  - **`detect_interval`**: Controls the interval at which the detection model adds prompts to SAM2. The default is `30`, meaning detection occurs every 30 frames. Set to `-1` to disable detection, but there must be at least one condition frame for inference. If using a preloaded memory bank (with all frames as condition frames), this can be set to `-1`. This parameter determines the frequency of condition frames.
-  - **`max_frame_num_to_track`**: Limits the inference propagation length during SAM2 video inference (`SAM2VideoPredictor.propagate_in_video`). Past frames beyond this length are considered to have sufficient information and are not re-inferred. Default: `60`. Must be at least twice `frame_buffer_size` to ensure all frames can be corrected in subsequent propagations.
-  - **`max_inference_state_frames`**: Part of memory optimization. Retains only a limited number of memory bank frames. Frames exceeding this limit are released. Default: `60`. Must be greater than or equal to `max_frame_num_to_track`. Increase this parameter if memory allows, as it retains more useful computation data.
-  - **`load_inference_state_path`**: Path to load a preloaded memory bank (in `.pkl` format). Default: `None`.
-  - **`save_inference_state_path`**: Path to save a memory bank for inference transfer to new videos. Default: `None`. For example, set this to `"output_inference_state/inference_state_frames.pkl"`. Ensure `max_inference_state_frames` is sufficiently large to provide enough valid memory information.
-
-
-
-- **Parameters for the `VideoProcessor.run()` inference function**:
-  - **`video_path`**: Path to the input MP4 video (optional, mutually exclusive with `frame_dir`). Default: `None`.
-  - **`frame_dir`**: Path to a directory containing video frames (optional, mutually exclusive with `video_path`). Default: `None`.
-  - **`output_video_segments_pkl_path`**: Path to save the dictionary of segmentation masks. This dictionary collects SAM2's output masks for post-processing or other operations. Default: `"./temp_output/video_segments.pkl"`.
-  - **`output_special_classes_detection_pkl_path`**: Path to save special class detection results in a `.pkl` file. If detection results are needed without SAM2 segmentation, this is where the results are saved. Default: `"./temp_output/special_classes_detection.pkl"`.
-
-
-
-- **The `VideoPostProcessor` class in `postprocess_det_sam2.py`**： is a post-processing class for the billiard scene based on Det-SAM2 output segmentation results. It is used to determine whether a ball goes into the pocket, whether balls collide, and whether a ball rebounds from the table edge. The initialization parameters of this class are strongly related to the video input resolution. The default parameters below are based on a resolution of 1920*1080. Specific scene samples can be found in the evaluation set at [Det-SAM2/data/Det-SAM2-Evaluation](https://huggingface.co/ATA-space/Det-SAM2/tree/main/data/Det-SAM2-Evaluation):
-
-  - `pot_distance_threshold`: Default is `100`. This threshold is used to determine whether the ball is near the pocket. Increasing this value will provide a larger detection range.
-  - `pot_velocity_threshold`: Default is `0.9`. This threshold is used to determine the direction of the ball’s velocity vector when it enters the pocket. Increasing this value allows for more lenient deviation from the pocket’s direction.
-  - `ball_distance_threshold`: Default is `120`. This is the threshold for determining if balls are close enough to collide. The collision is considered only if the distance between the two balls is within this value.
-  - `ball_velocity_threshold`: Default is `10`. This threshold is used to determine if a ball collision occurred based on the change in velocity (acceleration) after the collision. If the change exceeds this threshold, the collision is considered to have happened.
-  - `table_margin`: Default is `100`. This value creates a buffer zone extending a certain length from the table's edge to account for potential rebounds. Increasing this value will expand the area where a ball may rebound from the table edge.
-  - `rebound_velocity_threshold`: Default is `0.7`. This threshold is used to detect if a ball has rebounded from the table edge. Increasing this value makes it easier for the ball to be detected as having rebounded (indicating that the change in vertical velocity components before and after the collision does not exceed this threshold).
-
-  
-
-- **The `VideoPostProcessor.run()` inference function requires the following parameters:**
-
-  - `segments_dict_pkl`: Path to the PKL file containing the SAM2 segmentation dictionary, automatically generated by `det_sam2_RT.py`.
-  - `time_interval`: Default is `1.0`. This is the time interval used to calculate the velocity vector. Typically, the velocity vector is calculated based on the interval between consecutive frames.
-
-  
-
-- **The `DetSAM2Pipeline` class in `Det_SAM2_pipeline.py`** : initializes the `VideoProcessor` and `VideoPostProcessor` classes and asynchronously processes SAM2 inference and post-processing functions in the `DetSAM2Pipeline.inference()` method.
-
-  - `sam2_output_frame_dir`: Directory to save the SAM2 segmentation visualization results. Default is `"./temp_output/video_frames"`.
-  - `sam2_checkpoint_path`: Path to the SAM2 model weights. Default is `"../checkpoints/sam2.1_hiera_large.pt"`.
-  - `sam2_config_path`: Path to the SAM2 configuration file. Default is `"configs/sam2.1/sam2.1_hiera_l.yaml"`.
-  - `detect_model_weights`: Path to the YOLOv8 detection model weights. In the billiard scene example, the path is `"det_weights/train_referee12_960.pt"`.
-  - `output_video_dir`: Directory for the post-processed visualization output. Default is `"./pipeline_output"`.
-  - `load_inference_state_path`: Preloaded memory bank. Default is `None`. If a preloaded memory bank is needed, provide the path to it (the preloaded memory bank is automatically generated by the `det_sam2_RT.py` script, as explained in its parameter section).
-  - `visualize_postprocessor`: Whether to visualize post-processing results. Default is `False`. If post-processing results are visualized, constant memory overhead cannot be used, and the `VideoProcessor` class must retain all information in `video_processor.inference_state["images"]` to support post-processing visualization. Specifically, this is achieved by passing a `max_inference_state_frames` value larger than the total number of frames in the current video during the initialization of `VideoProcessor` in `DetSAM2Pipeline.__init__()`.
-
-  Note: During the initialization of the `DetSAM2Pipeline.__init__()` class, the `VideoProcessor` and `VideoPostProcessor` classes are instantiated. The `VideoProcessor` is reinitialized with parameters passed during initialization, while the `VideoPostProcessor` uses the default settings from `postprocess_det_sam2.py`.
-
-
-
-- **The `DetSAM2Pipeline.inference()` inference function requires the following parameters:**
-
-  - `video_source`: The video source, which can either be a local MP4 video path or an RTSP URL.
-  - `max_frames`: The maximum number of frames to process from the video stream. Once this frame limit is reached, the inference will end manually. The default is `2000`. In theory, it can handle an unlimited number of frames. `DetSAM2Pipeline.inference()` is implemented to maintain constant GPU/CPU memory usage.
-
-  
-
-- **The `EvalDetSAM2PostProcess` class in `eval_det-sam2.py`**: is used to find the optimal initialization parameter combination for `VideoProcessor` and `VideoPostProcessor` in the evaluation dataset. Its initialization parameters are:
-
-  - `sam2_output_frame_dir`: Temporary folder for storing SAM2 output mask frames. The default is `"./temp_output/det_sam2_RT_output"`.
-  - `sam2_checkpoint_path`: Path to SAM2 model weights. The default is `"../checkpoints/sam2.1_hiera_large.pt"`.
-  - `sam2_config_path`: Path to SAM2 configuration file. The default is `"configs/sam2.1/sam2.1_hiera_l.yaml"`.
-  - `detect_model_weights`: Path to YOLOv8 detection model weights. In the billiard scene example, the path is `"det_weights/train_referee12_960.pt"`.
-  - `load_inference_state_path`: Path to the preloaded memory bank. Default is `None`. If a preloaded memory bank is needed, provide the path to it (the preloaded memory bank is automatically generated by the `det_sam2_RT.py` script, as explained in its parameter section).
-  - `temp_video_segments_pkl`: Default is `"./temp_output/video_segments.pkl"`, which is the path to the `video_segments` dictionary containing temporary segmentation inference results from the `VideoProcessor` class.
-  - `temp_special_classes_detection_pkl`: Path to store detection results for special classes (i.e., categories where detection results do not need to be passed to SAM2 for segmentation inference, and once detected in any frame of the video, the `special_classes_detection` dictionary is considered complete). Default is `"./temp_output/special_classes_detection.pkl"`.
-  - `visualize_result_dir`: Path for visualizing the post-processing results from the `VideoPostProcessor` class. If set to `None`, no visualization is performed. Default is `None`.
-
-  
-
-- **The `EvalDetSAM2PostProcess.eval_all_settings()` inference function requires the following parameters:**
-
-  - `videos_dir`: Default is `"./data/Det-SAM2-Evaluation/videos"`, which is the folder containing the evaluation dataset videos.
-  - `eval_jsonl_path`: Default is `"./data/Det-SAM2-Evaluation/only_test.jsonl"`, which is the path to the evaluation dataset annotation file in JSONL format.
-  - `eval_output_dir`: Default is `"./eval_output/eval_result"`, which is the folder to store the evaluation results.
-
-  In addition to these, other parameters should be provided as lists. For example, if you want to evaluate the script with detection confidence values of `0.6`, `0.8`, and `0.9`, you should pass `[0.6, 0.8, 0.9]` for `detect_confidence_list`.
-
-
-
-
-
-
-
-
-
-
-

@@ -4,9 +4,7 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import contextlib
 import math
-import warnings
 from functools import partial
 from typing import Tuple, Type
 
@@ -16,29 +14,6 @@ from torch import nn, Tensor
 
 from sam2.modeling.position_encoding import apply_rotary_enc, compute_axial_cis
 from sam2.modeling.sam2_utils import MLP
-from sam2.utils.misc import get_sdpa_settings
-
-warnings.simplefilter(action="ignore", category=FutureWarning)
-# 检查是否可以使用 Flash Attention（默认使用），如果不行则使用所有可用的内核
-OLD_GPU, USE_FLASH_ATTN, MATH_KERNEL_ON = get_sdpa_settings()
-# 如果 Flash Attention 失败，则允许使用所有可用的内核
-ALLOW_ALL_KERNELS = False
-
-
-def sdp_kernel_context(dropout_p):
-    """
-    获取注意力缩放点积内核的上下文。默认使用 Flash Attention，
-    如果 Flash Attention 失败，则回退到所有可用的内核。
-    """
-    if ALLOW_ALL_KERNELS:
-        return contextlib.nullcontext()
-
-    return torch.backends.cuda.sdp_kernel(
-        enable_flash=USE_FLASH_ATTN,
-        # 如果 Flash Attention 内核关闭，则需要启用数学内核
-        enable_math=(OLD_GPU and dropout_p > 0.0) or MATH_KERNEL_ON,
-        enable_mem_efficient=OLD_GPU,
-    )
 
 
 class TwoWayTransformer(nn.Module):
@@ -263,20 +238,7 @@ class Attention(nn.Module):
 
         dropout_p = self.dropout_p if self.training else 0.0    # 如果是训练模式，则使用dropout概率
         # Attention计算
-        try:
-            with sdp_kernel_context(dropout_p):
-                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)  # 计算缩放点积注意力
-        except Exception as e:
-            # 如果Flash Attention内核失败，则回退到所有内核
-            warnings.warn(
-                f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
-                f"kernels for scaled_dot_product_attention (which may have a slower speed).",
-                category=UserWarning,
-                stacklevel=2,
-            )
-            global ALLOW_ALL_KERNELS
-            ALLOW_ALL_KERNELS = True  # 允许使用所有可用内核
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)  # 重新计算缩放点积注意力
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)  # 重新组合头
         out = self.out_proj(out)  # 进行最终的线性投影
@@ -294,7 +256,7 @@ class RoPEAttention(Attention):
         # 是否重复q的rope以匹配k的长度
         # 这对于记忆的交叉注意力是必要的
         rope_k_repeat=False,
-        feat_sizes=(32, 32),  # [w, h] 表示512分辨率下的stride 16特征图尺寸
+        feat_sizes=(64, 64),  # [w, h] 表示1024分辨率下的stride 16特征图尺寸
         **kwargs,
     ):
         super().__init__(*args, **kwargs)  # 调用父类构造函数
@@ -305,7 +267,9 @@ class RoPEAttention(Attention):
         )
         # 计算旋转位置编码的频率
         freqs_cis = self.compute_cis(end_x=feat_sizes[0], end_y=feat_sizes[1])
-        self.freqs_cis = freqs_cis  # 保存频率编码
+        self.freqs_cis = (
+            freqs_cis.to("cuda") if torch.cuda.is_available() else freqs_cis
+        )  # 将频率编码移到GPU上
         self.rope_k_repeat = rope_k_repeat  # 是否重复k的rope
 
     def forward(
@@ -342,20 +306,7 @@ class RoPEAttention(Attention):
 
         dropout_p = self.dropout_p if self.training else 0.0  # 如果是训练模式，则使用dropout概率
         # 注意力计算 Attention
-        try:
-            with sdp_kernel_context(dropout_p):
-                out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)  # 计算缩放点积注意力
-        except Exception as e:
-            # # 如果Flash Attention内核失败，则回退到所有内核
-            warnings.warn(
-                f"Flash Attention kernel failed due to: {e}\nFalling back to all available "
-                f"kernels for scaled_dot_product_attention (which may have a slower speed).",
-                category=UserWarning,
-                stacklevel=2,
-            )
-            global ALLOW_ALL_KERNELS
-            ALLOW_ALL_KERNELS = True  # 允许使用所有可用内核
-            out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)  # 重新计算缩放点积注意力
+        out = F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p)
 
         out = self._recombine_heads(out)  # 重新组合头
         out = self.out_proj(out)  # 进行最终的线性投影

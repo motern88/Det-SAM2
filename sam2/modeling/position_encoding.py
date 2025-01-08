@@ -25,6 +25,10 @@ class PositionEmbeddingSine(nn.Module):
         temperature: int = 10000,
         normalize: bool = True,
         scale: Optional[float] = None,
+        # 以下设置仅与编译时缓存预热相关
+        warmup_cache: bool = True,
+        image_size: int = 1024,
+        strides: Tuple[int] = (4, 8, 16, 32),
     ):
         super().__init__()
         assert num_pos_feats % 2 == 0, "期望模型宽度为偶数"  # 确保嵌入维度是偶数
@@ -38,6 +42,12 @@ class PositionEmbeddingSine(nn.Module):
         self.scale = scale
 
         self.cache = {}  # 缓存计算过的位置编码
+        if warmup_cache and torch.cuda.is_available():
+            # 为CUDA预热缓cache，来帮助编译
+            device = torch.device("cuda")
+            for stride in strides:
+                cache_key = (image_size // stride, image_size // stride)
+                self._pe(1, device, *cache_key)
 
     def _encode_xy(self, x, y):
         # 假定位置是归一化后的 The positions are expected to be normalized
@@ -76,19 +86,20 @@ class PositionEmbeddingSine(nn.Module):
         return pos
 
     @torch.no_grad()
-    def forward(self, x: torch.Tensor):
-        cache_key = (x.shape[-2], x.shape[-1])  # 根据输入的空间大小生成缓存键
+    def _pe(self, B, device, *cache_key):
+        H, W = cache_key
         if cache_key in self.cache:  # 如果缓存中已经有相应的编码
-            return self.cache[cache_key][None].repeat(x.shape[0], 1, 1, 1)  # 返回缓存的编码
+            return self.cache[cache_key].to(device)[None].repeat(B, 1, 1, 1)  # 返回缓存的编码
+
         y_embed = (
-            torch.arange(1, x.shape[-2] + 1, dtype=torch.float32, device=x.device)
+            torch.arange(1, H + 1, dtype=torch.float32, device=device)
             .view(1, -1, 1)
-            .repeat(x.shape[0], 1, x.shape[-1])  # 生成y方向的嵌入
+            .repeat(B, 1, W)  # 生成y方向的嵌入
         )
         x_embed = (
-            torch.arange(1, x.shape[-1] + 1, dtype=torch.float32, device=x.device)
+            torch.arange(1, W + 1, dtype=torch.float32, device=device)
             .view(1, 1, -1)
-            .repeat(x.shape[0], x.shape[-2], 1)  # 生成x方向的嵌入
+            .repeat(B, H, 1)  # 生成x方向的嵌入
         )
 
         if self.normalize:  # 如果需要归一化
@@ -96,7 +107,7 @@ class PositionEmbeddingSine(nn.Module):
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale  # 归一化y方向的嵌入
             x_embed = x_embed / (x_embed[:, :, -1:] + eps) * self.scale  # 归一化x方向的嵌入
 
-        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=x.device)
+        dim_t = torch.arange(self.num_pos_feats, dtype=torch.float32, device=device)
         dim_t = self.temperature ** (2 * (dim_t // 2) / self.num_pos_feats)  # 计算频率基数
 
         pos_x = x_embed[:, :, :, None] / dim_t  # 计算x方向的位置编码
@@ -111,6 +122,11 @@ class PositionEmbeddingSine(nn.Module):
         self.cache[cache_key] = pos[0]  # 缓存位置编码
         return pos  # 返回位置编码
 
+    @torch.no_grad()
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B = x.shape[0]
+        cache_key = (x.shape[-2], x.shape[-1])
+        return self._pe(B, x.device, *cache_key)
 
 class PositionEmbeddingRandom(nn.Module):
     """

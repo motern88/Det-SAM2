@@ -4,12 +4,10 @@
 # This source code is licensed under the license found in the
 # LICENSE file in the root directory of this source tree.
 
-import warnings
 from collections import OrderedDict
 
 import torch
 import gc
-import torch.nn.functional as F
 
 from tqdm import tqdm
 
@@ -29,16 +27,15 @@ class SAM2VideoPredictor(SAM2Base):
         # 添加修正点击后是否清除周围帧的非条件记忆（可能包含过时信息）；
         # 注意：这仅适用于*单对象跟踪*，除非 `clear_non_cond_mem_for_multi_obj` 也设置为 True）
         clear_non_cond_mem_around_input=False,
-        # 如果 `add_all_frames_to_correct_as_cond` 为 True，我们还会将任何收到后续修正点击的帧添加到条件帧列表中
-        # 如果 `add_all_frames_to_correct_as_cond` 为 False，则条件帧列表仅使用那些最初的条件帧
-        add_all_frames_to_correct_as_cond=False,
+        # 是否还清除周围帧的非条件记忆（仅在 `clear_non_cond_mem_around_input` 为 True 时有效）。
+        clear_non_cond_mem_for_multi_obj=False,
         **kwargs,
     ):
         super().__init__(**kwargs)
         self.fill_hole_area = fill_hole_area
         self.non_overlap_masks = non_overlap_masks
         self.clear_non_cond_mem_around_input = clear_non_cond_mem_around_input
-        self.add_all_frames_to_correct_as_cond = add_all_frames_to_correct_as_cond
+        self.clear_non_cond_mem_for_multi_obj = clear_non_cond_mem_for_multi_obj
 
     # 初始化inference_state
     @torch.inference_mode()
@@ -91,6 +88,12 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["obj_id_to_idx"] = OrderedDict()
         inference_state["obj_idx_to_id"] = OrderedDict()
         inference_state["obj_ids"] = []
+        # 存储模型在每帧上的跟踪结果和状态。节省开销：
+        # 字典["cond_frame_outputs"]中["maskmem_features"]和["pred_masks"]均存储在storage_device上
+        inference_state["output_dict"] = {
+            "cond_frame_outputs": {},  # 包含 {frame_idx: <out>} 的字典
+            "non_cond_frame_outputs": {},  # 包含 {frame_idx: <out>} 的字典
+        }
         # 每个对象跟踪结果的切片（视图），与 "output_dict" 共享相同的内存。已确保其中["maskmem_features"]存储在storage_device上
         inference_state["output_dict_per_obj"] = {}
         # 临时存储，当用户与帧交互时（例如添加点击或mask），新输出会存储在此
@@ -98,8 +101,13 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["temp_output_dict_per_obj"] = {}
         # 已经包含从点击或掩膜输入合并后的输出的帧
         # （我们在跟踪过程中直接使用它们的合并输出）
+        inference_state["consolidated_frame_inds"] = {
+            "cond_frame_outputs": set(),  # 包含帧索引的集合
+            "non_cond_frame_outputs": set(),  # 包含帧索引的集合
+        }
         # 每个跟踪帧的元数据（例如，跟踪方向）
-        inference_state["frames_tracked_per_obj"] = {}
+        inference_state["tracking_has_started"] = False
+        inference_state["frames_already_tracked"] = {}
         # 预加载内存库中所有条件帧索引和所有非条件帧索引
         inference_state["preloading_memory_cond_frame_idx"] = None
         inference_state["preloading_memory_non_cond_frames_idx"] = None
@@ -217,8 +225,8 @@ class SAM2VideoPredictor(SAM2Base):
         if obj_idx is not None:
             return obj_idx  # 如果对象 ID 已存在，直接返回对应的对象索引
 
-        # 始终支持增加新类别
-        allow_new_object = True
+        # # 这是一个新对象 ID，之前没有发送到服务器。我们只允许在跟踪开始之前添加新对象。
+        allow_new_object = not inference_state["tracking_has_started"]  # 判断是否是非跟踪过程中添加新对象
         if allow_new_object:  # 跟踪未开始时添加新的类别
             # 获取下一个对象插槽
             obj_idx = len(inference_state["obj_id_to_idx"])  # 分配新的对象索引
@@ -236,14 +244,91 @@ class SAM2VideoPredictor(SAM2Base):
                 "cond_frame_outputs": {},  # 包含 {frame_idx: <out>} 的字典
                 "non_cond_frame_outputs": {},  # 包含 {frame_idx: <out>} 的字典
             }
-            inference_state["frames_tracked_per_obj"][obj_idx] = {}
             return obj_idx  # 返回新分配的对象索引
-        else:
-            raise RuntimeError(
-                f"在跟踪开始后无法添加新对象 ID {obj_id}。 "
-                f"所有现有的对象 ID: {inference_state['obj_ids']}。"
-                f"请调用 'reset_state' 重新开始。"
-            )  # 如果跟踪已经开始，抛出错误
+        else:  # 跟踪开始时添加新的类别
+            # 获取下一个对象插槽
+            obj_idx = len(inference_state["obj_id_to_idx"])  # 分配新的对象索引
+            inference_state["obj_id_to_idx"][obj_id] = obj_idx  # 更新对象 ID 到索引的映射
+            inference_state["obj_idx_to_id"][obj_idx] = obj_id  # 更新对象索引到 ID 的映射
+            inference_state["obj_ids"] = list(inference_state["obj_id_to_idx"])  # 更新对象 ID 列表
+            # 为此对象设置输入和输出结构
+            inference_state["point_inputs_per_obj"][obj_idx] = {}  # 初始化此对象的点输入结构
+            inference_state["mask_inputs_per_obj"][obj_idx] = {}  # 初始化此对象的掩膜输入结构
+            inference_state["output_dict_per_obj"][obj_idx] = {
+                "cond_frame_outputs": {},  # 包含 {frame_idx: <out>} 的字典
+                "non_cond_frame_outputs": {},  # 包含 {frame_idx: <out>} 的字典
+            }
+            inference_state["temp_output_dict_per_obj"][obj_idx] = {
+                "cond_frame_outputs": {},  # 包含 {frame_idx: <out>} 的字典
+                "non_cond_frame_outputs": {},  # 包含 {frame_idx: <out>} 的字典
+            }
+
+            # 打印的函数
+            def print_consolidated_out(consolidated_out):
+                for key, value in consolidated_out.items():
+                    if isinstance(value, torch.Tensor):
+                        print(f"Key: {key}, Value: Tensor, Shape: {value.shape}")
+                    elif isinstance(value, dict):
+                        print(f"Key: {key}, Value: dict")
+                        print_consolidated_out(value)  # 递归打印嵌套的字典
+                    elif isinstance(value, list):
+                        print(f"Key: {key}, Value: list, Length: {len(value)}")
+                    else:
+                        print(f"Key: {key}, Value: {value}")
+
+            preloading_memory_cond_frame_idx = inference_state["preloading_memory_cond_frame_idx"]  # 预加载内存库中条件帧索引列表
+            max_update_length = inference_state["max_update_length_for_new_obj_id"]  # 获取需要更新的最大长度
+            print(f"跟踪过程中出现新的客户端ID，正在以最新ID映射标准更新内存库中最近{max_update_length}帧信息和预加载内存库信息(如果存在)")
+
+            output_dict = inference_state["output_dict"]
+            cond_frame_indices = sorted(output_dict["cond_frame_outputs"].keys())  # 获取所有条件帧索引并按时间顺序排序
+            # 只选择最近的 max_update_length 帧索引
+            if max_update_length > 0:
+                cond_frame_indices = cond_frame_indices[-max_update_length:]
+            # 添加预加载内存库中的条件帧进入更新队列
+            if preloading_memory_cond_frame_idx is not None:
+                for t in preloading_memory_cond_frame_idx:
+                    if t not in cond_frame_indices:
+                        cond_frame_indices.append(t)
+            # 以新的映射标准更新所有历史条件帧
+            for cond_frame_idx in tqdm(cond_frame_indices,desc=f"更新最近{max_update_length}帧和预加载内存库内的条件帧"):
+                consolidated_out = self._consolidate_temp_output_across_obj(
+                    inference_state,
+                    frame_idx=cond_frame_idx,
+                    is_cond=True,
+                    run_mem_encoder=True,
+                    consolidate_at_video_res=False,
+                )
+                # print_consolidated_out(consolidated_out)
+                # 将它们合并到 "output_dict" 中
+
+                output_dict["cond_frame_outputs"][cond_frame_idx] = consolidated_out
+                self._add_output_per_object(
+                    inference_state, cond_frame_idx, consolidated_out, storage_key="cond_frame_outputs"
+                )
+            # # 以新的映射标准更新所有历史非条件帧 TODO：更新非条件帧是否必要？注释掉似乎也能跑，如无必要则可以省这一步，减少计算开销
+            # non_cond_frame_outputs = inference_state["output_dict"]["non_cond_frame_outputs"]
+            # for non_cond_frame_idx in tqdm(non_cond_frame_outputs.keys(),desc="更新所有历史非条件帧"):
+            #     consolidated_out = self._consolidate_temp_output_across_obj(
+            #         inference_state,
+            #         frame_idx=non_cond_frame_idx,
+            #         is_cond=False,
+            #         run_mem_encoder=True,
+            #         consolidate_at_video_res=False,
+            #     )
+            #     # print_consolidated_out(consolidated_out)
+            #     # 将它们合并到 "output_dict" 中
+            #     output_dict["non_cond_frame_outputs"][non_cond_frame_idx] = consolidated_out
+            #     self._add_output_per_object(
+            #         inference_state, non_cond_frame_idx, consolidated_out, storage_key="non_cond_frame_outputs"
+            #     )
+            return obj_idx  # 返回新分配的对象索引
+
+            # raise RuntimeError(
+            #     f"在跟踪开始后无法添加新对象 ID {obj_id}。 "
+            #     f"所有现有的对象 ID: {inference_state['obj_ids']}。"
+            #     f"请调用 'reset_state' 重新开始。"
+            # )  # 如果跟踪已经开始，抛出错误
 
     def _obj_idx_to_id(self, inference_state, obj_idx):
         """将模型端的对象索引映射到客户端的对象 ID。"""
@@ -270,7 +355,8 @@ class SAM2VideoPredictor(SAM2Base):
         # print(f"add_new_points_or_box帧索引：{frame_idx},客户端obj_id：{obj_id}的框提示,模型端obj_idx:{obj_idx}")
         point_inputs_per_frame = inference_state["point_inputs_per_obj"][obj_idx]  # 获取对应帧的点输入
         mask_inputs_per_frame = inference_state["mask_inputs_per_obj"][obj_idx]  # 获取对应帧的掩码输入
-
+        # print(f"开始时point_inputs_per_frame:{point_inputs_per_frame}")
+        # print(f"开始时mask_inputs_per_frame:{mask_inputs_per_frame}")
 
         if (points is not None) != (labels is not None):  # 如果点和标签没有同时提供，抛出异常
             raise ValueError("points and labels 必须一起提供")
@@ -298,6 +384,13 @@ class SAM2VideoPredictor(SAM2Base):
                     "不能在不清除旧点的情况下添加 box，因为 box 提示必须在点提示之前提供 "
                     "(请使用 clear_old_points=True)"
                 )
+            # if inference_state["tracking_has_started"]:  # 如果跟踪已经开始，发出警告，提示 box 可能无法有效融合
+            #     warnings.warn(
+            #         "在跟踪开始后添加 box。SAM 2 可能无法始终有效地将 box 提示用于精炼。如果您打算 "
+            #         "在跟踪开始前使用 box 提示，请调用 'reset_state' 来重置推理状态。",
+            #         category=UserWarning,
+            #         stacklevel=2,
+            #     )
             if not isinstance(box, torch.Tensor):  # 如果 box 不是张量，将其转换为张量
                 box = torch.tensor(box, dtype=torch.float32, device=points.device)
             box_coords = box.reshape(1, 2, 2)  # 将 box 重塑为 (1, 2, 2) 的形状
@@ -324,18 +417,19 @@ class SAM2VideoPredictor(SAM2Base):
         point_inputs_per_frame[frame_idx] = point_inputs  # 更新帧的点输入
         mask_inputs_per_frame.pop(frame_idx, None)  # 移除旧的掩码输入
 
-
+        # print(f"过程中point_inputs_per_frame:{point_inputs_per_frame}")
+        # print(f"过程中mask_inputs_per_frame:{mask_inputs_per_frame}")
 
         # 如果此帧之前没有被跟踪过，我们将其视为初始条件帧，
         # 这意味着输入点将用于在该帧上生成分割结果，而不使用其他帧的记忆（如同在 SAM 中）。
         # 否则（如果已被跟踪），输入点将用于校正已经跟踪的掩码。
-        obj_frames_tracked = inference_state["frames_tracked_per_obj"][obj_idx]
-        is_init_cond_frame = frame_idx not in obj_frames_tracked
+        is_init_cond_frame = frame_idx not in inference_state["frames_already_tracked"]
+        # print(f"is_init_cond_frame:{is_init_cond_frame}")  # True
         # 是否按相反的时间顺序跟踪
         if is_init_cond_frame:
             reverse = False
         else:
-            reverse = obj_frames_tracked[frame_idx]["reverse"]
+            reverse = inference_state["frames_already_tracked"][frame_idx]["reverse"]
         obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]  # 获取对象的输出字典
         obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]  # 获取对象的临时输出字典
 
@@ -412,6 +506,7 @@ class SAM2VideoPredictor(SAM2Base):
             inference_state,
             frame_idx,  # 当前帧索引
             is_cond=is_cond,  # 是否是条件帧
+            run_mem_encoder=False,  # 不运行内存编码器
             consolidate_at_video_res=True,  # 在视频分辨率下整合输出
         )
         # 获取原始视频分辨率下的输出掩码
@@ -447,6 +542,7 @@ class SAM2VideoPredictor(SAM2Base):
         # 确保掩码是二维的
         assert mask.dim() == 2
         mask_H, mask_W = mask.shape
+
         mask_inputs_orig = mask[None, None]  # 为掩码添加批次和通道维度
         mask_inputs_orig = mask_inputs_orig.float().to(inference_state["device"])  # 将掩码转换为浮点型并移动到指定设备上
 
@@ -470,13 +566,12 @@ class SAM2VideoPredictor(SAM2Base):
         # 如果该帧之前没有被追踪过，我们将其视为初始条件帧，
         # 这意味着输入的点将用于在该帧上生成分割，而不使用其他帧的任何记忆，就像在 SAM 中一样。
         # 否则（如果该帧已经被追踪过），输入的点将用于修正已经追踪到的掩码。
-        obj_frames_tracked = inference_state["frames_tracked_per_obj"][obj_idx]
-        is_init_cond_frame = frame_idx not in obj_frames_tracked
+        is_init_cond_frame = frame_idx not in inference_state["frames_already_tracked"]
         # 判断是否按时间逆序进行追踪
         if is_init_cond_frame:
             reverse = False
         else:
-            reverse = obj_frames_tracked[frame_idx]["reverse"]
+            reverse = inference_state["frames_already_tracked"][frame_idx]["reverse"]
         # 获取当前对象的输出字典和临时输出字典
         obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
         obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
@@ -508,6 +603,7 @@ class SAM2VideoPredictor(SAM2Base):
             inference_state,
             frame_idx,
             is_cond=is_cond,
+            run_mem_encoder=False,
             consolidate_at_video_res=True,
         )
         # 获取调整为原始视频分辨率的输出掩码
@@ -548,6 +644,7 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state,
         frame_idx,
         is_cond,
+        run_mem_encoder,
         consolidate_at_video_res=False,
     ):
         """
@@ -563,6 +660,7 @@ class SAM2VideoPredictor(SAM2Base):
         storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"  # 根据条件选择输出字典的键
         # 可选地，我们允许在原始视频分辨率上合并临时输出（以提供更好的掩码提示编辑体验）。
         if consolidate_at_video_res:
+            assert not run_mem_encoder, "记忆编码器不能在视频分辨率下运行"
             consolidated_H = inference_state["video_height"]  # 获取视频高度
             consolidated_W = inference_state["video_width"]  # 获取视频宽度
             consolidated_mask_key = "pred_masks_video_res"  # 设置合并掩码的键
@@ -574,13 +672,29 @@ class SAM2VideoPredictor(SAM2Base):
         # 将在对对象分数应用非重叠约束后重新运行记忆编码器时添加。
         # 它的 "pred_masks" 使用一个较大的负值 (NO_OBJ_SCORE) 预填充，以表示缺失的对象。
         consolidated_out = {
+            "maskmem_features": None,
+            "maskmem_pos_enc": None,
             consolidated_mask_key: torch.full(
                 size=(batch_size, 1, consolidated_H, consolidated_W),
                 fill_value=NO_OBJ_SCORE,  # 使用 NO_OBJ_SCORE 作为缺失对象的填充值
                 dtype=torch.float32,
                 device=inference_state["storage_device"],
             ),
+            "obj_ptr": torch.full(
+                size=(batch_size, self.hidden_dim),
+                fill_value=NO_OBJ_SCORE,  # 使用 NO_OBJ_SCORE 作为缺失对象的填充值
+                dtype=torch.float32,
+                device=inference_state["device"],
+            ),
+            "object_score_logits": torch.full(
+                size=(batch_size, 1),
+                # 默认将 object_score_logits 设置为 10.0，即假设物体存在，因为 sigmoid(10)=1，这与 `MaskDecoder` 的 `predict_masks` 中的设置相同。
+                fill_value=10.0,
+                dtype=torch.float32,
+                device=inference_state["device"],
+            ),
         }
+        empty_mask_ptr = None
         for obj_idx in range(batch_size):
             obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]  # 获取每个对象的临时输出字典
             obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]  # 获取每个对象的输出字典
@@ -596,6 +710,15 @@ class SAM2VideoPredictor(SAM2Base):
             # 并将其掩码分数留作默认分数（即上面 NO_OBJ_SCORE 的占位符），
             # 并将其对象指针设置为虚拟指针。
             if out is None:
+                # 为那些在这一帧没有任何输入或跟踪结果的对象填充虚拟对象指针
+                # （仅在 `run_mem_encoder=True` 时进行，即当我们需要为跟踪构建记忆时）。
+                if run_mem_encoder:
+                    if empty_mask_ptr is None:
+                        empty_mask_ptr = self._get_empty_mask_ptr(
+                            inference_state, frame_idx
+                        )
+                    # 使用基于空掩码的虚拟指针填充对象指针
+                    consolidated_out["obj_ptr"][obj_idx : obj_idx + 1] = empty_mask_ptr
                 continue
             # 将临时对象输出掩码添加到合并输出掩码中
             obj_mask = out["pred_masks"]
@@ -611,76 +734,161 @@ class SAM2VideoPredictor(SAM2Base):
                     align_corners=False,
                 )
                 consolidated_pred_masks[obj_idx : obj_idx + 1] = resized_obj_mask
+            consolidated_out["obj_ptr"][obj_idx : obj_idx + 1] = out["obj_ptr"]  # 更新对象指针
+            consolidated_out["object_score_logits"][obj_idx : obj_idx + 1] = out[
+                "object_score_logits"
+            ]
+
+        # 可选地，在合并的分数上应用非重叠约束，并重新运行记忆编码器
+        if run_mem_encoder:
+            device = inference_state["device"]
+            high_res_masks = torch.nn.functional.interpolate(
+                consolidated_out["pred_masks"].to(device, non_blocking=True),
+                size=(self.image_size, self.image_size),
+                mode="bilinear",
+                align_corners=False,
+            )
+            if self.non_overlap_masks_for_mem_enc:
+                high_res_masks = self._apply_non_overlapping_constraints(high_res_masks)
+            maskmem_features, maskmem_pos_enc = self._run_memory_encoder(
+                inference_state=inference_state,
+                frame_idx=frame_idx,
+                batch_size=batch_size,
+                high_res_masks=high_res_masks,
+                object_score_logits=consolidated_out["object_score_logits"],
+                is_mask_from_pts=True,  # 这些帧是用户交互的结果
+            )
+
+            consolidated_out["maskmem_features"] = maskmem_features  # 更新记忆编码器特征,已经位于storage_device上
+            consolidated_out["maskmem_pos_enc"] = maskmem_pos_enc  # 更新记忆编码器位置编码
 
         return consolidated_out  # 返回合并后的输出
+
+    def _get_empty_mask_ptr(self, inference_state, frame_idx):
+        """根据当前帧上的空掩码获取一个虚拟对象指针。"""
+        # 创建一个只有一个对象的虚拟（空）掩码
+        batch_size = 1
+        mask_inputs = torch.zeros(
+            (batch_size, 1, self.image_size, self.image_size),  # 掩码尺寸与图像尺寸一致
+            dtype=torch.float32,
+            device=inference_state["device"],  # 使用推理状态中的设备
+        )
+
+        # 获取当前图像特征
+        (
+            _,
+            _,
+            current_vision_feats,  # 当前图像特征
+            current_vision_pos_embeds,  # 当前图像位置嵌入
+            feat_sizes,  # 特征尺寸
+        ) = self._get_image_feature(inference_state, frame_idx, batch_size)
+
+        # 将空掩码和上述图像特征输入，获取一个虚拟对象指针
+        current_out = self.track_step(
+            frame_idx=frame_idx,
+            is_init_cond_frame=True,  # 表示这是初始条件帧
+            current_vision_feats=current_vision_feats,
+            current_vision_pos_embeds=current_vision_pos_embeds,
+            feat_sizes=feat_sizes,
+            point_inputs=None,  # 没有点输入
+            mask_inputs=mask_inputs,  # 使用空掩码
+            output_dict={},
+            num_frames=inference_state["num_frames"],
+            track_in_reverse=False,
+            run_mem_encoder=False,  # 不运行记忆编码器
+            prev_sam_mask_logits=None,
+            preloading_memory_cond_frame_idx=None, # 不传入预加载内存库中条件帧索引
+        )
+        return current_out["obj_ptr"]  # 返回虚拟对象指针
 
     @torch.inference_mode()
     def propagate_in_video_preflight(self, inference_state):
         """准备推理状态，并在跟踪之前合并临时输出。"""
-        # 检查并确保每个对象都已经接收到了输入点或mask。
+        # 跟踪已经开始，不允许在会话重置之前添加新对象。
+        inference_state["tracking_has_started"] = True
         batch_size = self._get_obj_num(inference_state)  # 获取对象(需要跟踪的物体)的数量
-        if batch_size == 0:
-            raise RuntimeError(
-                "没有为任何对象提供输入点或mask；请先添加输入。"
-            )
         # print(f"propagate_in_video_preflight中batch_size:{batch_size}")
 
         # 合并 "temp_output_dict_per_obj" 中的每个对象的临时输出，并将其添加到 "output_dict" 中。
-        for obj_idx in range(batch_size):
-            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-            obj_temp_output_dict = inference_state["temp_output_dict_per_obj"][obj_idx]
-            for is_cond in [False, True]:
-                # 单独合并条件帧和非条件帧的临时输出
-                storage_key = (
-                    "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+        temp_output_dict_per_obj = inference_state["temp_output_dict_per_obj"]
+        output_dict = inference_state["output_dict"]
+        # "consolidated_frame_inds" 包含那些已合并临时输出的帧的索引（无论是在当前调用还是之前调用 `propagate_in_video_preflight` 时）。
+        consolidated_frame_inds = inference_state["consolidated_frame_inds"]
+
+        for is_cond in [False, True]:
+            # 分别合并条件和非条件临时输出
+            storage_key = "cond_frame_outputs" if is_cond else "non_cond_frame_outputs"
+            # 查找包含任何对象的临时输出的所有帧
+            # （这些应是刚刚通过 `add_new_points_or_box` 或 `add_new_mask` 收到点击以获取掩码输入的帧）
+            temp_frame_inds = set()
+            for obj_temp_output_dict in temp_output_dict_per_obj.values():
+                temp_frame_inds.update(obj_temp_output_dict[storage_key].keys())
+            # 收集并更新每个对象的临时帧推理结果的索引，并将这些索引合并到全局的帧索引记录中
+            consolidated_frame_inds[storage_key].update(temp_frame_inds)
+            # print(f"{'条件帧' if is_cond else '非条件帧'}合并的帧索引: {sorted(temp_frame_inds)}")
+            # # 非条件帧[]，条件帧[90,105]
+
+            # 合并这些帧上的所有对象的临时输出
+            for frame_idx in temp_frame_inds:
+                # print(f"frame_idx:{frame_idx}")
+                consolidated_out = self._consolidate_temp_output_across_obj(
+                    inference_state, frame_idx, is_cond=is_cond, run_mem_encoder=True
                 )
-                # 查找所有包含对象临时输出的帧
-                # （这些应该是刚刚接收到通过 `add_new_points_or_box` 或 `add_new_mask` 输入的掩膜数据的帧）
-                for frame_idx, out in obj_temp_output_dict[storage_key].items():
-                    # 对临时输出运行记忆编码器（如果记忆特征缺失）
-                    if out["maskmem_features"] is None:
-                        # 对预测的掩膜进行高分辨率插值（将掩膜调整为指定大小）
-                        high_res_masks = torch.nn.functional.interpolate(
-                            out["pred_masks"].to(inference_state["device"]),  # 将掩膜数据转移到设备上
-                            size=(self.image_size, self.image_size),  # 调整大小为 image_size
-                            mode="bilinear",  # 使用双线性插值
-                            align_corners=False,  # 不对齐角点
-                        )
-                        # 使用记忆编码器处理高分辨率掩膜（包括位置编码）
-                        maskmem_features, maskmem_pos_enc = self._run_memory_encoder(
-                            inference_state=inference_state,  # 推理状态
-                            frame_idx=frame_idx,  # 当前帧的索引
-                            batch_size=1,  # 在单个对象的切片上运行
-                            high_res_masks=high_res_masks,  # 高分辨率掩膜
-                            object_score_logits=out["object_score_logits"],  # 对象评分的 logits
-                            # 这些帧是用户交互过的帧
-                            is_mask_from_pts=True,  # 掩膜是来自点击的点
-                        )
-                        # 将记忆特征和位置编码保存到输出字典中
-                        out["maskmem_features"] = maskmem_features
-                        out["maskmem_pos_enc"] = maskmem_pos_enc
 
-                    # 清除 `temp_output_dict_per_obj` 中的临时输出
-                    obj_output_dict[storage_key][frame_idx] = out
-                    if self.clear_non_cond_mem_around_input:
-                        # 清除非条件记忆周围的帧
-                        self._clear_obj_non_cond_mem_around_input(
-                            inference_state, frame_idx, obj_idx
-                        )
+                # def print_consolidated_out(consolidated_out):  # 打印合并的输出
+                #     for key, value in consolidated_out.items():
+                #         if isinstance(value, torch.Tensor):
+                #             print(f"Key: {key}, Value: Tensor, Shape: {value.shape}")
+                #         elif isinstance(value, dict):
+                #             print(f"Key: {key}, Value: dict")
+                #             print_consolidated_out(value)  # 递归打印嵌套的字典
+                #         elif isinstance(value, list):
+                #             print(f"Key: {key}, Value: list, Length: {len(value)}")
+                #         else:
+                #             print(f"Key: {key}, Value: {value}")
+                # print_consolidated_out(consolidated_out)
 
-                # 清除 `temp_output_dict_per_obj` 中的临时输出
+                # 将它们合并到 "output_dict" 中，同时创建每个对象的切片
+                output_dict[storage_key][frame_idx] = consolidated_out
+                self._add_output_per_object(
+                    inference_state, frame_idx, consolidated_out, storage_key
+                )
+                clear_non_cond_mem = self.clear_non_cond_mem_around_input and (
+                    self.clear_non_cond_mem_for_multi_obj or batch_size <= 1
+                )
+                if clear_non_cond_mem:
+                    # 清除周围帧的非条件记忆
+                    self._clear_non_cond_mem_around_input(inference_state, frame_idx)
+
+            # 清除 `temp_output_dict_per_obj` 中的临时输出
+            for obj_temp_output_dict in temp_output_dict_per_obj.values():
                 obj_temp_output_dict[storage_key].clear()
 
-            # 检查并确保每个对象都收到了输入点或掩码
-            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]  # 获取当前对象的输出字典
-            if len(obj_output_dict["cond_frame_outputs"]) == 0:  # 如果没有条件帧输出
-                obj_id = self._obj_idx_to_id(inference_state, obj_idx)  # 获取对象的ID
-                raise RuntimeError(
-                    f"No input points or masks are provided for object id {obj_id}; please add inputs first."
-                )
-            # 边缘情况：如果将输出添加到 "cond_frame_outputs" 中，则从 "non_cond_frame_outputs" 中移除同一帧上的任何先前输出
+        # 边界情况：如果在 "cond_frame_outputs" 中添加了输出，则删除在同一帧上的任何先前的 "non_cond_frame_outputs"
+        # （我们不希望在同一帧上即使条件帧又是非条件帧）。
+        for frame_idx in output_dict["cond_frame_outputs"]:
+            output_dict["non_cond_frame_outputs"].pop(frame_idx, None)
+        for obj_output_dict in inference_state["output_dict_per_obj"].values():
             for frame_idx in obj_output_dict["cond_frame_outputs"]:
                 obj_output_dict["non_cond_frame_outputs"].pop(frame_idx, None)
+        for frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
+            assert frame_idx in output_dict["cond_frame_outputs"]
+            consolidated_frame_inds["non_cond_frame_outputs"].discard(frame_idx)
+
+        # 确保 "consolidated_frame_inds" 中的帧索引正好是那些有点输入或掩码输入的帧（在正确的工作流下应为真）。
+        all_consolidated_frame_inds = (
+            consolidated_frame_inds["cond_frame_outputs"]
+            | consolidated_frame_inds["non_cond_frame_outputs"]
+        )
+        input_frames_inds = set()
+        for point_inputs_per_frame in inference_state["point_inputs_per_obj"].values():
+            input_frames_inds.update(point_inputs_per_frame.keys())
+        for mask_inputs_per_frame in inference_state["mask_inputs_per_obj"].values():
+            input_frames_inds.update(mask_inputs_per_frame.keys())
+
+        # 我尝试实现release_old_frames()以去除旧的条件帧与非条件帧以节省内存时,被官方的这个断言卡住,
+        # 注释掉这个断言,我个人认为是没有问题的,释放旧条件帧势必会清空consolidated_frame_inds的索引,事实上,这些索引在此后的propagate传播中都不会再被使用到
+        # assert all_consolidated_frame_inds == input_frames_inds  # 确保所有合并的帧索引都与输入帧索引一致
 
     def print_gpu_memory(self):  # TODO:暂时用于开发时查看显存使用情况，实际生产状态不会使用
         try:
@@ -711,6 +919,8 @@ class SAM2VideoPredictor(SAM2Base):
         self.propagate_in_video_preflight(inference_state)  # 合并临时输出，清除无用的记忆，并确保推理状态的一致性
 
         # 从处理好的 inference_state 中提取信息
+        output_dict = inference_state["output_dict"]
+        consolidated_frame_inds = inference_state["consolidated_frame_inds"]
         obj_ids = inference_state["obj_ids"]
         num_frames = inference_state["num_frames"]
         batch_size = self._get_obj_num(inference_state)
@@ -728,14 +938,19 @@ class SAM2VideoPredictor(SAM2Base):
         # print(f"obj_ids追踪的对象 ID 列表: {obj_ids}")
         # print(f"视频当前总帧数num_frames: {num_frames}")
 
+        if len(output_dict["cond_frame_outputs"]) == 0:
+            raise RuntimeError("没有提供点；请先添加点")
+
+        # 根据设置决定是否清除非条件记忆
+        clear_non_cond_mem = self.clear_non_cond_mem_around_input and (
+            self.clear_non_cond_mem_for_multi_obj or batch_size <= 1
+        )
+        # print(f"是否清除非条件记忆clear_non_cond_mem：{clear_non_cond_mem}")
+
         # 设置起始索引、结束索引和处理顺序
         if start_frame_idx is None:
             # 默认从第一个有输入点的帧开始
-            start_frame_idx = min(
-                t
-                for obj_output_dict in inference_state["output_dict_per_obj"].values()
-                for t in obj_output_dict["cond_frame_outputs"]
-            )
+            start_frame_idx = min(output_dict["cond_frame_outputs"])
             # print(f"起始帧(从第一个条件帧开始):{start_frame_idx}")
         if max_frame_num_to_track is None:
             # print(f"max_frame_num_to_track is None,跟踪视频所有帧")
@@ -758,54 +973,91 @@ class SAM2VideoPredictor(SAM2Base):
 
         # 遍历处理顺序中的每一帧
         for frame_idx in tqdm(processing_order, desc=f"propagate in video start:{start_frame_idx},end:{end_frame_idx}"):
-            pred_masks_per_obj = [None] * batch_size
-            for obj_idx in range(batch_size):
-                obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-                # 跳过那些已经在合并输出中的帧（这些帧已经接收到输入点击或掩码）。
-                # 注意，我们不能直接执行批处理推理，因为每个对象上的点击数可能不同。
-                if frame_idx in obj_output_dict["cond_frame_outputs"]:
-                    storage_key = "cond_frame_outputs"
-                    current_out = obj_output_dict[storage_key][frame_idx]
-                    device = inference_state["device"]
-                    pred_masks = current_out["pred_masks"].to(device, non_blocking=True)
-                    if self.clear_non_cond_mem_around_input:
-                        # 清除周围帧的非条件记忆
-                        self._clear_obj_non_cond_mem_around_input(
-                            inference_state, frame_idx, obj_idx
-                        )
-                else:
-                    storage_key = "non_cond_frame_outputs"
-                    current_out, pred_masks = self._run_single_frame_inference(
-                        inference_state=inference_state,
-                        output_dict=obj_output_dict,
-                        frame_idx=frame_idx,
-                        batch_size=1,  # 在单个对象的切片上运行
-                        is_init_cond_frame=False,
-                        point_inputs=None,
-                        mask_inputs=None,
-                        reverse=reverse,
-                        run_mem_encoder=True,
-                    )
-                    obj_output_dict[storage_key][frame_idx] = current_out  # current_out中['maskmem_features']和['pred_masks']位于storage_device上
+        # for frame_idx in processing_order:
+            # 跳过那些已经在合并输出中的帧（这些帧已经接收到输入点击或掩码）。
+            # 注意，我们不能直接执行批处理推理，因为每个对象上的点击数可能不同。
+            if frame_idx in consolidated_frame_inds["cond_frame_outputs"]:
+                # print(f"帧索引{frame_idx}，已有条件帧输出，不对其推理")
+                storage_key = "cond_frame_outputs"
+                current_out = output_dict[storage_key][frame_idx]
+                pred_masks = current_out["pred_masks"]
+                if clear_non_cond_mem:
+                    # 清除周围帧的非条件记忆
+                    self._clear_non_cond_mem_around_input(inference_state, frame_idx)
+            elif frame_idx in consolidated_frame_inds["non_cond_frame_outputs"]:
+                # print(f"帧索引{frame_idx}，已有非条件帧输出，不对其推理")
+                storage_key = "non_cond_frame_outputs"
+                current_out = output_dict[storage_key][frame_idx]
+                pred_masks = current_out["pred_masks"]
+            else:
+                # print(f"帧索引{frame_idx}，未经过处理，进行单帧推理！")
+                # 对于未处理的帧，进行单帧推理
+                storage_key = "non_cond_frame_outputs"
+                current_out, pred_masks = self._run_single_frame_inference(
+                    inference_state=inference_state,
+                    output_dict=output_dict,
+                    frame_idx=frame_idx,
+                    batch_size=batch_size,
+                    is_init_cond_frame=False,
+                    point_inputs=None,
+                    mask_inputs=None,
+                    reverse=reverse,
+                    run_mem_encoder=True,
+                )
 
-                inference_state["frames_tracked_per_obj"][obj_idx][frame_idx] = {
-                    "reverse": reverse
-                }
-                pred_masks_per_obj[obj_idx] = pred_masks
+                output_dict[storage_key][frame_idx] = current_out  # current_out中['maskmem_features']和['pred_masks']位于storage_device上
+
+            # 为每个对象创建输出切片，以便后续交互
+            self._add_output_per_object(
+                inference_state, frame_idx, current_out, storage_key
+            )  # 某一帧上的推理结果按对象进行分割并添加到inference_state中
+
+            # 记录某帧是否已经被跟踪过，并且保存该帧的跟踪方向
+            inference_state["frames_already_tracked"][frame_idx] = {"reverse": reverse}
 
             # 将输出掩码调整到原始视频分辨率（直接使用GPU上的掩码分数以避免中间的CPU转换）
-            if len(pred_masks_per_obj) > 1:
-                all_pred_masks = torch.cat(pred_masks_per_obj, dim=0)
-            else:
-                all_pred_masks = pred_masks_per_obj[0]
             _, video_res_masks = self._get_orig_video_res_output(
-                inference_state, all_pred_masks
+                inference_state, pred_masks
             )
+
             yield frame_idx, obj_ids, video_res_masks  # 返回当前帧索引、对象ID和视频分辨率掩码
+
+    def _add_output_per_object(
+        self, inference_state, frame_idx, current_out, storage_key
+    ):
+        """
+        将多对象输出拆分为每个对象的输出切片，并将它们添加到 `output_dict_per_obj` 中。
+        结果切片共享相同的张量存储。
+        """
+        maskmem_features = current_out["maskmem_features"]
+        assert maskmem_features is None or isinstance(maskmem_features, torch.Tensor)
+
+        maskmem_pos_enc = current_out["maskmem_pos_enc"]
+        assert maskmem_pos_enc is None or isinstance(maskmem_pos_enc, list)
+
+        output_dict_per_obj = inference_state["output_dict_per_obj"]
+        for obj_idx, obj_output_dict in output_dict_per_obj.items():
+            # 为每个对象创建切片
+            obj_slice = slice(obj_idx, obj_idx + 1)
+            obj_out = {
+                "maskmem_features": None,
+                "maskmem_pos_enc": None,
+                "pred_masks": current_out["pred_masks"][obj_slice],
+                "obj_ptr": current_out["obj_ptr"][obj_slice],
+                "object_score_logits": current_out["object_score_logits"][obj_slice],
+            }
+            # 如果有 maskmem_features，则将其添加到对象输出中
+            if maskmem_features is not None:
+                obj_out["maskmem_features"] = maskmem_features[obj_slice]  # 在storage_device上
+            # 如果有 maskmem_pos_enc，则将其添加到对象输出中
+            if maskmem_pos_enc is not None:
+                obj_out["maskmem_pos_enc"] = [x[obj_slice] for x in maskmem_pos_enc]   # 在GPU上
+            # 将对象的输出添加到 `output_dict_per_obj` 中
+            obj_output_dict[storage_key][frame_idx] = obj_out
 
     @torch.inference_mode()
     def clear_all_prompts_in_frame(
-        self, inference_state, frame_idx, obj_id, need_output=True
+            self, inference_state, frame_idx, obj_id, need_output=True
     ):
         """在指定帧上为给定的物体清除所有输入点或掩码。"""
         # 根据对象 ID 获取对象索引
@@ -819,16 +1071,45 @@ class SAM2VideoPredictor(SAM2Base):
         temp_output_dict_per_obj[obj_idx]["cond_frame_outputs"].pop(frame_idx, None)
         temp_output_dict_per_obj[obj_idx]["non_cond_frame_outputs"].pop(frame_idx, None)
 
-        # 移除该帧的条件输出（可能将其降级为非条件输出）
-        obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]
-        out = obj_output_dict["cond_frame_outputs"].pop(frame_idx, None)
-        if out is not None:
-            # 由于该帧不再是条件帧（因为它没有接收输入），所以我们将其输出（如果存在的话）‘降级’为非条件帧的输出。
-            obj_output_dict["non_cond_frame_outputs"][frame_idx] = out
-            inference_state["frames_tracked_per_obj"][obj_idx].pop(frame_idx, None)
+        # 检查当前帧是否仍然有任何对象的输入
+        batch_size = self._get_obj_num(inference_state)
+        frame_has_input = False
+        for obj_idx2 in range(batch_size):
+            if frame_idx in inference_state["point_inputs_per_obj"][obj_idx2]:
+                frame_has_input = True
+                break
+            if frame_idx in inference_state["mask_inputs_per_obj"][obj_idx2]:
+                frame_has_input = True
+                break
+
+        # 如果该帧不再有任何对象的输入，则进一步清除该帧的条件状态
+        if not frame_has_input:
+            output_dict = inference_state["output_dict"]
+            consolidated_frame_inds = inference_state["consolidated_frame_inds"]
+            consolidated_frame_inds["cond_frame_outputs"].discard(frame_idx)
+            consolidated_frame_inds["non_cond_frame_outputs"].discard(frame_idx)
+
+            # 移除该帧的条件输出（可能降级为非条件帧输出）
+            out = output_dict["cond_frame_outputs"].pop(frame_idx, None)
+            if out is not None:
+                # 由于该帧不再接收输入，它不再是条件帧，将其降级为非条件帧输出
+                output_dict["non_cond_frame_outputs"][frame_idx] = out
+                inference_state["frames_already_tracked"].pop(frame_idx, None)
+
+            # 同样的处理每个对象的切片输出
+            for obj_idx2 in range(batch_size):
+                obj_output_dict = inference_state["output_dict_per_obj"][obj_idx2]
+                obj_out = obj_output_dict["cond_frame_outputs"].pop(frame_idx, None)
+                if obj_out is not None:
+                    obj_output_dict["non_cond_frame_outputs"][frame_idx] = obj_out
+
+            # 如果所有条件帧都被移除，也要清除跟踪输出
+            if len(output_dict["cond_frame_outputs"]) == 0:
+                self._reset_tracking_results(inference_state)
 
         if not need_output:
             return
+
         # 最后，输出每个对象的更新后的掩码（在上面移除输入后）
         obj_ids = inference_state["obj_ids"]
         is_cond = any(
@@ -839,6 +1120,7 @@ class SAM2VideoPredictor(SAM2Base):
             inference_state,
             frame_idx,
             is_cond=is_cond,
+            run_mem_encoder=False,
             consolidate_at_video_res=True,
         )
         _, video_res_masks = self._get_orig_video_res_output(
@@ -859,7 +1141,6 @@ class SAM2VideoPredictor(SAM2Base):
         inference_state["mask_inputs_per_obj"].clear()
         inference_state["output_dict_per_obj"].clear()
         inference_state["temp_output_dict_per_obj"].clear()
-        inference_state["frames_tracked_per_obj"].clear()
 
     def _reset_tracking_results(self, inference_state):
         """重置视频中的所有跟踪输入和结果。"""
@@ -877,9 +1158,16 @@ class SAM2VideoPredictor(SAM2Base):
         for v in inference_state["temp_output_dict_per_obj"].values():
             v["cond_frame_outputs"].clear()
             v["non_cond_frame_outputs"].clear()
-        # 清空每个对象已追踪帧字典的值
-        for v in inference_state["frames_tracked_per_obj"].values():
-            v.clear()
+        # 清空总输出字典中的条件帧输出和非条件帧输出
+        inference_state["output_dict"]["cond_frame_outputs"].clear()
+        inference_state["output_dict"]["non_cond_frame_outputs"].clear()
+        # 清空合并帧索引
+        inference_state["consolidated_frame_inds"]["cond_frame_outputs"].clear()
+        inference_state["consolidated_frame_inds"]["non_cond_frame_outputs"].clear()
+        # 重置跟踪状态
+        inference_state["tracking_has_started"] = False
+        # 清空已经跟踪的帧
+        inference_state["frames_already_tracked"].clear()
 
     def _get_image_feature(self, inference_state, frame_idx, batch_size):
         """计算给定帧上的图像特征。"""
@@ -937,26 +1225,28 @@ class SAM2VideoPredictor(SAM2Base):
         # 设置允许保留的最旧帧索引为 `frame_idx - max_inference_state_frames`，即只保留最近的 max_inference_state_frames 帧
         oldest_allowed_idx = frame_idx - max_inference_state_frames
 
-        # print(inference_state["output_dict_per_obj"][0]["cond_frame_outputs"].keys())
+        # 获取所有存储在inference_state['output_dict']中的帧索引
+        all_cond_frames_idx = inference_state['output_dict']['cond_frame_outputs'].keys()
+        all_non_cond_frames_idx = inference_state['output_dict']['non_cond_frame_outputs'].keys()
+        old_cond_frames_idx = [idx for idx in all_cond_frames_idx if (pre_frames - 1) < idx <= oldest_allowed_idx]  # 小于oldest_allowed_idx且大于预加载内存库（pre_frames-1）的帧索引
+        old_non_cond_frames_idx = [idx for idx in all_non_cond_frames_idx if (pre_frames - 1) < idx <= oldest_allowed_idx]  # 小于oldest_allowed_idx且大于预加载内存库（pre_frames-1）的帧索引
+        # print(f"old_cond_frames_idx:{old_cond_frames_idx}")
+        # print(f"old_non_cond_frames_idx:{old_non_cond_frames_idx}")
 
-        # 获取所有存储在inference_state['output_dict_per_obj']中的帧索引
-        all_obj_idx = inference_state['output_dict_per_obj'].keys()
-        for obj_idx in all_obj_idx:
-            all_cond_frames_idx = inference_state['output_dict_per_obj'][obj_idx]['cond_frame_outputs'].keys()
-            all_non_cond_frames_idx = inference_state['output_dict_per_obj'][obj_idx]['non_cond_frame_outputs'].keys()
+        for old_idx in old_non_cond_frames_idx:
+            # 删除'output_dict'中旧的非条件帧
+            inference_state['output_dict']['non_cond_frame_outputs'].pop(old_idx,None)
+            # 删除'output_dict_per_obj'中旧的非条件帧
+            for obj in inference_state['output_dict_per_obj'].keys():
+                inference_state['output_dict_per_obj'][obj]['non_cond_frame_outputs'].pop(old_idx,None)
 
-            old_cond_frames_idx = [idx for idx in all_cond_frames_idx if (pre_frames - 1) < idx <= oldest_allowed_idx]  # 小于oldest_allowed_idx且大于预加载内存库（pre_frames-1）的帧索引
-            old_non_cond_frames_idx = [idx for idx in all_non_cond_frames_idx if (pre_frames - 1) < idx <= oldest_allowed_idx]  # 小于oldest_allowed_idx且大于预加载内存库（pre_frames-1）的帧索引
-            # print(f"old_cond_frames_idx:{old_cond_frames_idx}")
-            # print(f"old_non_cond_frames_idx:{old_non_cond_frames_idx}")
-
-            for old_idx in old_non_cond_frames_idx:
-                # 删除'output_dict_per_obj'中旧的非条件帧
-                inference_state['output_dict_per_obj'][obj_idx]['non_cond_frame_outputs'].pop(old_idx,None)
-
-            for old_idx in old_cond_frames_idx:
-                # 删除'output_dict_per_obj'中旧的条件帧
-                inference_state['output_dict_per_obj'][obj_idx]['cond_frame_outputs'].pop(old_idx,None)
+        for old_idx in old_cond_frames_idx:
+            # 同时删除'output_dict'和'consolidated_frame_inds'中旧的条件帧
+            inference_state['output_dict']['cond_frame_outputs'].pop(old_idx,None)
+            inference_state['consolidated_frame_inds']['cond_frame_outputs'].discard(old_idx)
+            # 删除'output_dict_per_obj'中旧的条件帧
+            for obj in inference_state['output_dict_per_obj'].keys():
+                inference_state['output_dict_per_obj'][obj]['cond_frame_outputs'].pop(old_idx,None)
 
         if release_images: # 清除旧的视频帧
             old_image_indices = [idx for idx in inference_state["images_idx"] if (pre_frames - 1) < idx <= oldest_allowed_idx]
@@ -980,8 +1270,9 @@ class SAM2VideoPredictor(SAM2Base):
         # 批量删除后主动调用垃圾回收
         gc.collect()
 
-        # print(f"条件帧索引：{inference_state['output_dict_per_obj'][0]['cond_frame_outputs'].keys()}")
-        # print(f"非条件帧索引：{inference_state['output_dict_per_obj'][0]['non_cond_frame_outputs'].keys()}")
+        # print(f"output_dict条件帧索引：{inference_state['output_dict']['cond_frame_outputs'].keys()}")
+        # print(f"output_dict非条件帧索引：{inference_state['output_dict']['non_cond_frame_outputs'].keys()}")
+        # print(f"consolidated_frame_inds条件帧索引：{inference_state['consolidated_frame_inds']['cond_frame_outputs']}")
 
     # 执行单帧推理
     def _run_single_frame_inference(
@@ -1044,6 +1335,7 @@ class SAM2VideoPredictor(SAM2Base):
             maskmem_features = maskmem_features.to(torch.bfloat16)
             # 将特征转移到存储设备（如CPU）中
             maskmem_features = maskmem_features.to(storage_device, non_blocking=False)  # non_blocking=False
+
         pred_masks_gpu = current_out["pred_masks"]
         # 如果需要，填补预测掩膜中的空洞
         if self.fill_hole_area > 0:
@@ -1052,11 +1344,13 @@ class SAM2VideoPredictor(SAM2Base):
             )
         # 将预测掩膜转移到存储设备中
         pred_masks = pred_masks_gpu.to(storage_device, non_blocking=False)  # non_blocking=False
+
         # "maskmem_pos_enc"在所有帧中是相同的，所以只需要存储一份副本
         maskmem_pos_enc = self._get_maskmem_pos_enc(inference_state, current_out)
         # 对象指针是一个小张量，所以始终保留在GPU内存中以便快速访问
         obj_ptr = current_out["obj_ptr"]
         object_score_logits = current_out["object_score_logits"]
+
         # 制作当前帧输出的紧凑版本，以减少状态大小
         compact_current_out = {
             "maskmem_features": maskmem_features,  # 位于storage_device上
@@ -1065,6 +1359,7 @@ class SAM2VideoPredictor(SAM2Base):
             "obj_ptr": obj_ptr,
             "object_score_logits": object_score_logits,
         }
+
         return compact_current_out, pred_masks_gpu
 
     def _run_memory_encoder(
@@ -1074,7 +1369,7 @@ class SAM2VideoPredictor(SAM2Base):
         batch_size,
         high_res_masks,
         object_score_logits,
-        is_mask_from_pts,
+        is_mask_from_pts
     ):
         """
         在 `high_res_masks` 上运行记忆编码器。通常是在对对象分数应用非重叠约束之后进行的。
@@ -1205,9 +1500,30 @@ class SAM2VideoPredictor(SAM2Base):
         _map_keys(inference_state["mask_inputs_per_obj"])
         _map_keys(inference_state["output_dict_per_obj"])
         _map_keys(inference_state["temp_output_dict_per_obj"])
-        _map_keys(inference_state["frames_tracked_per_obj"])
 
-        # 第3步：进一步收集`obj_input_frames_inds`中那些帧上的输出，
+        # 第3步：对于打包的张量存储，我们索引剩余的ID并重建每个对象的切片。
+        def _slice_state(output_dict, storage_key):
+            for frame_idx, out in output_dict[storage_key].items():
+                out["maskmem_features"] = out["maskmem_features"][remain_old_obj_inds]
+                out["maskmem_pos_enc"] = [
+                    x[remain_old_obj_inds] for x in out["maskmem_pos_enc"]
+                ]
+                # "maskmem_pos_enc"在各帧间相同，因此我们只需要存储一份副本
+                out["maskmem_pos_enc"] = self._get_maskmem_pos_enc(inference_state, out)
+                out["pred_masks"] = out["pred_masks"][remain_old_obj_inds]
+                out["obj_ptr"] = out["obj_ptr"][remain_old_obj_inds]
+                out["object_score_logits"] = out["object_score_logits"][
+                    remain_old_obj_inds
+                ]
+                # 还需要更新每个对象的切片
+                self._add_output_per_object(
+                    inference_state, frame_idx, out, storage_key
+                )
+
+        _slice_state(inference_state["output_dict"], "cond_frame_outputs")
+        _slice_state(inference_state["output_dict"], "non_cond_frame_outputs")
+
+        # 第4步：进一步收集`obj_input_frames_inds`中那些帧上的输出，
         # 这些帧可能会显示被移除对象遮挡的对象的更新掩码。
         if need_output:
             temp_output_dict_per_obj = inference_state["temp_output_dict_per_obj"]
@@ -1220,6 +1536,7 @@ class SAM2VideoPredictor(SAM2Base):
                     inference_state,
                     frame_idx,
                     is_cond=is_cond,
+                    run_mem_encoder=False,
                     consolidate_at_video_res=True,
                 )
                 _, video_res_masks = self._get_orig_video_res_output(
@@ -1240,255 +1557,13 @@ class SAM2VideoPredictor(SAM2Base):
         # 计算需要清除的帧的起始索引和结束索引
         frame_idx_begin = frame_idx - r * self.num_maskmem
         frame_idx_end = frame_idx + r * self.num_maskmem
-        batch_size = self._get_obj_num(inference_state)
-        for obj_idx in range(batch_size):
-            obj_output_dict = inference_state["output_dict_per_obj"][obj_idx]  # 获取当前对象的输出字典
-            non_cond_frame_outputs = obj_output_dict["non_cond_frame_outputs"]  # 获取当前对象的非条件帧输出
-            for t in range(frame_idx_begin, frame_idx_end + 1):  # 遍历需要清除的帧索引范围
-                non_cond_frame_outputs.pop(t, None)  # 从非条件帧输出中移除该帧（如果存在的话
+        output_dict = inference_state["output_dict"]
+        non_cond_frame_outputs = output_dict["non_cond_frame_outputs"]
 
+        for t in range(frame_idx_begin, frame_idx_end + 1):
+            # 从输出字典中移除指定帧的非条件输出
+            non_cond_frame_outputs.pop(t, None)
 
-class SAM2VideoPredictorVOS(SAM2VideoPredictor):
-    """优化为VOS（视频目标分割）设置"""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)  # 调用父类（SAM2VideoPredictor）的构造函数
-        self._compile_all_components()  # 编译所有组件，以适应VOS设置
-
-    def _compile_all_components(self):
-        print("为VOS设置编译所有组件。第一次可能非常慢。")
-
-        # 编译 memory_encoder 的 forward 方法，使用 torch.compile 来加速
-        self.memory_encoder.forward = torch.compile(
-            self.memory_encoder.forward,
-            mode="max-autotune",  # 最大自动调优
-            fullgraph=True,  # 编译整个图
-            dynamic=False,  # 不允许动态修改图结构
-        )
-        # 编译 memory_attention 的 forward 方法，允许动态调整图结构
-        self.memory_attention.forward = torch.compile(
-            self.memory_attention.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=True,  # 内存数量变化时，图结构可以动态变化
-        )
-        # 编译 memory_attention 的 forward 方法，允许动态调整图结构
-        self.sam_prompt_encoder.forward = torch.compile(
-            self.sam_prompt_encoder.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=False,  # 设置为 False 会更准确，避免回归
-        )
-        # 编译 sam_prompt_encoder 的 forward 方法
-        self.sam_mask_decoder.forward = torch.compile(
-            self.sam_mask_decoder.forward,
-            mode="max-autotune",
-            fullgraph=True,
-            dynamic=False,  # 设置为 False 会更准确，避免回归
-        )
-
-    def forward_image(self, img_batch: torch.Tensor):
-        """
-        与父类（SAM2VideoPredictor）中对应的方法相同，但通过克隆骨干网络的特征和位置编码来支持编译。
-        """
-        backbone_out = self.image_encoder(img_batch)
-        if self.use_high_res_features_in_sam:
-            # 预先计算SAM解码器中的第0层和第1层特征
-            # 以避免在每次SAM点击时重复计算
-            backbone_out["backbone_fpn"][0] = self.sam_mask_decoder.conv_s0(
-                backbone_out["backbone_fpn"][0]
-            )
-            backbone_out["backbone_fpn"][1] = self.sam_mask_decoder.conv_s1(
-                backbone_out["backbone_fpn"][1]
-            )
-        # 克隆特征和位置编码，以帮助 torch.compile 进行优化
-        for i in range(len(backbone_out["backbone_fpn"])):
-            backbone_out["backbone_fpn"][i] = backbone_out["backbone_fpn"][i].clone()
-            backbone_out["vision_pos_enc"][i] = backbone_out["vision_pos_enc"][
-                i
-            ].clone()
-        return backbone_out
-
-    def _forward_sam_heads(
-        self,
-        backbone_features,
-        point_inputs=None,
-        mask_inputs=None,
-        high_res_features=None,
-        multimask_output=False,
-    ):
-        """
-        与父类（SAM2VideoPredictor）中的对应方法相同，但
-    克隆 prompt_encoder 和 mask_decoder 的输出以支持编译。
-        """
-        B = backbone_features.size(0)
-        device = backbone_features.device
-        assert backbone_features.size(1) == self.sam_prompt_embed_dim
-        assert backbone_features.size(2) == self.sam_image_embedding_size
-        assert backbone_features.size(3) == self.sam_image_embedding_size
-
-        # a) 处理点提示（point prompts）
-        if point_inputs is not None:
-            sam_point_coords = point_inputs["point_coords"]
-            sam_point_labels = point_inputs["point_labels"]
-            assert sam_point_coords.size(0) == B and sam_point_labels.size(0) == B
-        else:
-            # 如果没有提供点提示，则用一个空的点（标签为 -1）填充
-            sam_point_coords = torch.zeros(B, 1, 2, device=device)
-            sam_point_labels = -torch.ones(B, 1, dtype=torch.int32, device=device)
-
-        # b) 处理掩码提示（mask prompts）
-        if mask_inputs is not None:
-            # 如果提供了掩码输入，将其调整为低分辨率掩码输入并传递给 SAM 掩码编码器
-            assert len(mask_inputs.shape) == 4 and mask_inputs.shape[:2] == (B, 1)
-            if mask_inputs.shape[-2:] != self.sam_prompt_encoder.mask_input_size:
-                sam_mask_prompt = F.interpolate(
-                    mask_inputs.float(),
-                    size=self.sam_prompt_encoder.mask_input_size,
-                    align_corners=False,
-                    mode="bilinear",
-                    antialias=True,  # 使用抗锯齿来下采样
-                )
-            else:
-                sam_mask_prompt = mask_inputs
-        else:
-            # 否则，只需输入 None （SAM 的提示编码器将添加一个学习的 'no_mask_embed' 表示在这种情况下没有掩码输入）。
-            sam_mask_prompt = None
-
-        sparse_embeddings, dense_embeddings = self.sam_prompt_encoder(
-            points=(sam_point_coords, sam_point_labels),
-            boxes=None,
-            masks=sam_mask_prompt,
-        )
-        # 克隆图像位置编码（image_pe）和 sam_prompt_encoder 的输出以便支持编译
-        sparse_embeddings = sparse_embeddings.clone()
-        dense_embeddings = dense_embeddings.clone()
-        image_pe = self.sam_prompt_encoder.get_dense_pe().clone()
-        (
-            low_res_multimasks,
-            ious,
-            sam_output_tokens,
-            object_score_logits,
-        ) = self.sam_mask_decoder(
-            image_embeddings=backbone_features,
-            image_pe=image_pe,
-            sparse_prompt_embeddings=sparse_embeddings,
-            dense_prompt_embeddings=dense_embeddings,
-            multimask_output=multimask_output,
-            repeat_image=False,  # 图像已是批量处理，不需要重复
-            high_res_features=high_res_features,
-        )
-        # 克隆 sam_mask_decoder 的输出以便支持编译
-        low_res_multimasks = low_res_multimasks.clone()
-        ious = ious.clone()
-        sam_output_tokens = sam_output_tokens.clone()
-        object_score_logits = object_score_logits.clone()
-
-        if self.pred_obj_scores:
-            is_obj_appearing = object_score_logits > 0
-
-            # 用于空间记忆的掩码是一个硬选择（obj 或 no obj），与实际的掩码预测一致
-            low_res_multimasks = torch.where(
-                is_obj_appearing[:, None, None],
-                low_res_multimasks,
-                NO_OBJ_SCORE,
-            )
-
-        # 将掩码从可能的 bfloat16（或 float16）转换为 float32，以兼容旧版本 PyTorch
-        low_res_multimasks = low_res_multimasks.float()
-        high_res_multimasks = F.interpolate(
-            low_res_multimasks,
-            size=(self.image_size, self.image_size),
-            mode="bilinear",
-            align_corners=False,
-        )
-
-        sam_output_token = sam_output_tokens[:, 0]
-        if multimask_output:
-            # 如果启用了多掩码输出，选择最佳掩码（根据 IoU 选择）
-            best_iou_inds = torch.argmax(ious, dim=-1)
-            batch_inds = torch.arange(B, device=device)
-            low_res_masks = low_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            high_res_masks = high_res_multimasks[batch_inds, best_iou_inds].unsqueeze(1)
-            if sam_output_tokens.size(1) > 1:
-                sam_output_token = sam_output_tokens[batch_inds, best_iou_inds]
-        else:
-            low_res_masks, high_res_masks = low_res_multimasks, high_res_multimasks
-
-        # 从 SAM 输出 token 提取物体指针（处理遮挡情况）
-        obj_ptr = self.obj_ptr_proj(sam_output_token)
-        if self.pred_obj_scores:
-            # 允许软判断是否没有物体指针（不同于掩码的硬判断）
-            if self.soft_no_obj_ptr:
-                lambda_is_obj_appearing = object_score_logits.sigmoid()
-            else:
-                lambda_is_obj_appearing = is_obj_appearing.float()
-
-            if self.fixed_no_obj_ptr:
-                obj_ptr = lambda_is_obj_appearing * obj_ptr
-            obj_ptr = obj_ptr + (1 - lambda_is_obj_appearing) * self.no_obj_ptr
-
-        return (
-            low_res_multimasks,
-            high_res_multimasks,
-            ious,
-            low_res_masks,
-            high_res_masks,
-            obj_ptr,
-            object_score_logits,
-        )
-
-    def _encode_new_memory(
-        self,
-        current_vision_feats,
-        feat_sizes,
-        pred_masks_high_res,
-        object_score_logits,
-        is_mask_from_pts,
-    ):
-        """
-        与父类（SAM2VideoPredictor）中的对应方法相同，但克隆记忆和它们的位置编码（pos_enc）以支持编译。
-        """
-        B = current_vision_feats[-1].size(1)  # 当前帧的批量大小
-        C = self.hidden_dim
-        H, W = feat_sizes[-1]  # 顶层（最低分辨率）特征的大小
-        # 顶层特征，从（HW）BC 格式转换为 BCHW 格式
-        pix_feat = current_vision_feats[-1].permute(1, 2, 0).view(B, C, H, W)
-        if self.non_overlap_masks_for_mem_enc and not self.training:
-            # 如果启用了非重叠掩码约束，并且当前是评估模式（而非训练模式），
-            # 则应用非重叠约束（只在评估时使用，且批量大小为 1 时所有物体来自同一视频）
-            pred_masks_high_res = self._apply_non_overlapping_constraints(
-                pred_masks_high_res
-            )
-        # 在应用 sigmoid 之前，先使用温度对原始掩码的 logits 进行缩放
-        binarize = self.binarize_mask_from_pts_for_mem_enc and is_mask_from_pts
-        if binarize and not self.training:
-            # 如果需要二值化，并且当前是评估模式，使用阈值处理掩码
-            mask_for_mem = (pred_masks_high_res > 0).float()
-        else:
-            # 否则，使用 sigmoid 将原始掩码 logits 转换为 (0, 1) 范围的概率
-            mask_for_mem = torch.sigmoid(pred_masks_high_res)
-        # 对 sigmoid 输出的概率应用缩放和偏置
-        if self.sigmoid_scale_for_mem_enc != 1.0:
-            mask_for_mem = mask_for_mem * self.sigmoid_scale_for_mem_enc
-        if self.sigmoid_bias_for_mem_enc != 0.0:
-            mask_for_mem = mask_for_mem + self.sigmoid_bias_for_mem_enc
-
-        # 将处理后的掩码输入到 memory_encoder 中
-        maskmem_out = self.memory_encoder(
-            pix_feat, mask_for_mem, skip_mask_sigmoid=True  # 因为已经应用了 sigmoid，因此跳过 sigmoid 步骤
-        )
-        # 克隆特征（feats）和位置编码（pos_enc），以便支持编译
-        maskmem_features = maskmem_out["vision_features"].clone()
-        maskmem_pos_enc = [m.clone() for m in maskmem_out["vision_pos_enc"]]
-        # 如果存在无物体嵌入（no-object embedding），则将其添加到空间记忆中
-        # 以指示当前帧被预测为遮挡（即帧中没有物体出现）
-        if self.no_obj_embed_spatial is not None:
-            is_obj_appearing = (object_score_logits > 0).float()
-            maskmem_features += (
-                1 - is_obj_appearing[..., None, None]
-            ) * self.no_obj_embed_spatial[..., None, None].expand(
-                *maskmem_features.shape
-            )
-
-        return maskmem_features, maskmem_pos_enc
+            # 从每个对象的输出字典中移除指定帧的非条件输出
+            for obj_output_dict in inference_state["output_dict_per_obj"].values():
+                obj_output_dict["non_cond_frame_outputs"].pop(t, None)
